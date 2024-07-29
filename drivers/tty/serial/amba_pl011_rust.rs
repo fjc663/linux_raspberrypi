@@ -1115,7 +1115,8 @@ impl UartPortOps for AmbaPl011Pops {
         port: &UartPort,
         new: *mut bindings::ktermios,
         old: *const bindings::ktermios,
-    ) {
+    )
+    {
         let mut port_ptr = unsafe { &mut *port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
