@@ -49,6 +49,7 @@ config SERIAL_AMBA_PL011_RUST
 	tristate "ARM AMBA PL011 serial port support in Rust"
 	depends on ARM_AMBA
 	select SERIAL_CORE
+	default m
 	help
 	  This selects the ARM(R) AMBA(R) PrimeCell PL011 UART.  If you have
 	  an Integrator/PP2, Integrator/CP or Versatile platform, say Y or M

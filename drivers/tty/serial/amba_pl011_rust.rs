@@ -1,211 +1,1462 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Driver for AMBA serial ports (PL011).
+//! AMBA串口驱动程序（PL011）。
 //!
-//! Based on the C driver written by ARM Ltd/Deep Blue Solutions Ltd.
+//! 基于由ARM Ltd/Deep Blue Solutions Ltd编写的C驱动程序。
 
 use kernel::{
-    bindings,
-    prelude::*, 
-    amba, 
-    clk::Clk, 
-    device, 
-    error::{code::*, Result},
-    module_amba_driver,
-    c_str,
-    io_mem::IoMem, 
-    serial:: {
-        uart_console::{Console, ConsoleOps, flags}, 
-        uart_driver::UartDriver, 
-        uart_port::{UartPort, PortRegistration},
-        pl011_config::*,
+    bindings,  // 内核绑定
+    prelude::*,  // 导入内核预导入模块
+    amba,  // AMBA（高级微控制器总线架构）模块
+    clk::Clk,  // 时钟模块
+    device,  // 设备模块
+    new_device_data,
+    error::{code::*, Result},  // 错误处理模块，包括错误代码和结果类型
+    module_amba_driver,  // AMBA驱动模块
+    c_str,  // C风格字符串模块
+    str::CString,
+    irq,
+    io_mem::IoMem,  // IO内存模块
+    types::ForeignOwnable,
+    delay::coarse_sleep,
+    serial::{  // 串口模块
+               uart_console::{Console, ConsoleOps, flags},  // 串口控制台相关模块，包括控制台、控制台操作和标志
+               uart_driver::UartDriver,  // 串口驱动模块
+               uart_port::{UartPort, PortRegistration, UartPortOps},  // 串口端口模块，包括串口端口和端口注册
+               pl011_config::*,  // PL011配置模块
     },
 };
+use core::{
+    time::Duration,
+    fmt::Write,
+    pin::{pin, Pin},
+    ptr,
+    ffi::c_void,
+};
+use alloc::boxed::Box;
 
+// UART寄存器的大小
 const UART_SIZE: usize = 0x200;
+// 内存映射IO类型
 const UPIO_MEM: u32 = 2;
 const UPIO_MEM32: u32 = 3;
 
+// 启动自动配置标志
 pub const UPF_BOOT_AUTOCONF: u64 = 1_u64 << 28;
 
+// UART端口数量
 pub(crate) const UART_NR: usize = 14;
+// AMBA主设备号
 const AMBA_MAJOR: i32 = 204;
+// AMBA次设备号
 const AMBA_MINOR: i32 = 64;
+
+
+const TIOCSER_TEMT: usize = 0x01;
+const UPSTAT_AUTORTS: bindings::upstat_t = 1 << 2;
+const UPSTAT_AUTOCTS: bindings::upstat_t = 1 << 3;
+const SER_RS485_ENABLED: u32 = 1 << 0;
+const SER_RS485_RX_DURING_TX: u32 = 1 << 4;
+const SER_RS485_RTS_ON_SEND: u32 = 1 << 1;
+const MAX_UDELAY_MS: u64 = 5;
+const AMBA_ISR_PASS_LIMIT: u32 = 256;
+const UART_DR_ERROR: u32 = UART011_DR_OE | UART011_DR_BE | UART011_DR_PE | UART011_DR_FE;
+const TASK_INTERRUPTIBLE: u32 = 0x00000001;
+const PAGE_SIZE: i32 = 1 << PAGE_SHIFT;
+const PAGE_SHIFT: i32 = 12;
+const UART_XMIT_SIZE: i32 = PAGE_SIZE;
+const WAKEUP_CHARS: i32 = 256;
+const SER_RS485_RTS_AFTER_SEND: u32 = 1 << 2;
+const UART_DUMMY_DR_RX: u32 = 1 << 16;
+const UPF_HARDPPS_CD: bindings::upf_t = bindings::ASYNC_HARDPPS_CD as bindings::upf_t;
+
+// 设备名称
 const DEV_NAME: &CStr = c_str!("ttyAMA");
+// 驱动程序名称
 const DRIVER_NAME: &CStr = c_str!("ttyAMA");
 
-/// A static's struct with all uart_port
+static PL011_STD_OFFSETS: [u32; REG_ARRAY_SIZE] = initialize_offsets();
+
+
+// 静态结构体，包含所有的UART端口
 pub(crate) static mut PORTS: [Option<UartPort>; UART_NR] = [None; UART_NR];
 
-/// This amba_uart_console static's struct
+// AMBA UART控制台的静态结构体
 static AMBA_CONSOLE: Console = {
-    let name:[i8; 16usize] =[
-        't' as _, 't' as _, 'y' as _, 'A' as _, 'M' as _, 'A' as _, 
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    let name: [i8; 16usize] = [
+        't' as _, 't' as _, 'y' as _, 'A' as _, 'M' as _, 'A' as _,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
-    Console::new::<Pl011Console>(name,UART_DRIVER.as_ptr())
-    .with_config(
-        (flags::CON_PRINTBUFFER | flags::CON_ANYTIME) as _,
-        -1,0,  0, 0, 0, 0,
-    ) 
+    Console::new::<Pl011Console>(name, UART_DRIVER.as_ptr())
+        .with_config(
+            (flags::CON_PRINTBUFFER | flags::CON_ANYTIME) as _,
+            -1, 0, 0, 0, 0, 0,
+        )
 };
 
-/// This uart_driver static's struct
+// UART驱动程序的静态结构体
 pub(crate) static UART_DRIVER: UartDriver = UartDriver::new(
-    &THIS_MODULE, 
-    DRIVER_NAME, 
+    &THIS_MODULE,
+    DRIVER_NAME,
     DEV_NAME,
-    &AMBA_CONSOLE
-    ).with_config(
-        AMBA_MAJOR, 
-        AMBA_MINOR, 
-        UART_NR as _,
-    );
+    &AMBA_CONSOLE,
+).with_config(
+    AMBA_MAJOR,
+    AMBA_MINOR,
+    UART_NR as _,
+);
 
-/// This is Struct of pl011_console
+// pl011控制台的结构体
 struct Pl011Console;
-/// Implement supported `Pl011Console`'s operations here.
+// 实现`Pl011Console`的操作
 #[vtable]
 impl ConsoleOps for Pl011Console {
     type Data = ();
 
     fn console_write(_co: &Console, _s: *const i8, _count: u32) {
+        // unsafe {
+        //     // 获取 UART 端口
+        //     let uap = &PORTS[co.index];
+        //     let mut locked = true;
+        //     let mut old_cr = 0;
+        //     let mut new_cr;
+        //
+        //     // 启用时钟
+        //     if let Some(uap) = uap {
+        //
+        //     }
+        //
+        // }
+
         pr_info!("console_write ok");
     }
 
-    fn console_read(_co: &Console, _s: *mut i8, _count: u32) -> Result<i32>{
+    fn console_read(_co: &Console, _s: *mut i8, _count: u32) -> Result<i32> {
         pr_info!("console_read ok");
         Ok(0)
     }
 
     fn console_match(
-        _co: &Console, 
-        _name: *mut i8 , 
-        _idx: i32, 
+        _co: &Console,
+        _name: *mut i8,
+        _idx: i32,
         _options: *mut i8,
-    ) -> Result<i32>{
+    ) -> Result<i32> {
         pr_info!("console_match ok");
         Ok(0)
     }
 
-    fn console_device(_co: &Console, _index: *mut i8) -> *mut bindings::tty_driver{
+    fn console_device(_co: &Console, _index: *mut i8) -> *mut bindings::tty_driver {
         pr_info!("console_device ok");
         todo!()
     }
 }
 
+// VENDOR数据的静态结构体
 pub(crate) static VENDOR_DATA: VendorData = VendorData {
-    ifls:    UART011_IFLS_RX4_8 | UART011_IFLS_TX4_8,
+    reg_offset: PL011_STD_OFFSETS,
+    ifls: UART011_IFLS_RX4_8 | UART011_IFLS_TX4_8,
     fr_busy: UART01X_FR_BUSY,
-    fr_dsr:  UART01X_FR_DSR,
-    fr_cts:  UART01X_FR_CTS,
-    fr_ri:   UART011_FR_RI,
-    inv_fr:  0,
-    access_32b:           false,
-    oversampling:         false,
-    dma_threshold:        false,
+    fr_dsr: UART01X_FR_DSR,
+    fr_cts: UART01X_FR_CTS,
+    fr_ri: UART011_FR_RI,
+    inv_fr: 0,
+    access_32b: false,
+    oversampling: false,
+    dma_threshold: false,
     cts_event_workaround: false,
-    always_enabled:       false,
-    fixfixed_options:     false,
+    always_enabled: false,
+    fixfixed_options: false,
 };
 
+// PL011数据的结构体
 #[derive(Default, Copy, Clone)]
 struct PL011Data {
-    reg_offset: u16,
+    reg_offset: [u32; REG_ARRAY_SIZE],
     im: u32,
     old_status: u32,
     fifosize: u32,
-    fixed_baud:u32,
-    type_ : u32,
-    // vendor: VendorData,
+    fixed_baud: u32,
+    type_: [u8; 12],
+    vendor: VendorData,
+    rs485_tx_started: bool,
+    rs485_tx_drain_interval: u64,
 }
 
+// PL011资源的结构体
 struct PL011Resources {
     base: IoMem<UART_SIZE>,
     parent_irq: u32,
 }
 
+// PL011注册类型
 type PL011Registrations = PortRegistration<PL011Device>;
+// PL011设备数据类型
 type PL011DeviceData = device::Data<PL011Registrations, PL011Resources, PL011Data>;
 
-// Linux Raw id table
+struct Pl011Handler {}
+
+impl irq::Handler for Pl011Handler {
+    type Data = Box<UartPort>;
+
+    fn handle_irq(data: &UartPort) -> irq::Return {
+        let port_ptr = unsafe { &*data.as_ptr() };
+        let mut flags: u64 = 0;
+        let mut handled = false;
+        let mut pass_counter = AMBA_ISR_PASS_LIMIT;
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+
+        flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        // 读取当前的中断状态并掩码掉未启用的中断
+        let mut status = AmbaPl011Pops::pl011_read(data, Register::RegRis as usize) & pl011_data.im;
+        if status != 0 {
+            loop {
+                // 检查并应用 CTS 事件的临时解决方案
+                AmbaPl011Pops::check_apply_cts_event_workaround(data);
+                // 清除处理过的中断
+                AmbaPl011Pops::pl011_write(status & !(UART011_TXIS | UART011_RTIS |
+                    UART011_RXIS), data, Register::RegIcr as usize);
+
+                // 处理接收字符的中断
+                if status & (UART011_RTIS | UART011_RXIS) != 0 {
+                    AmbaPl011Pops::pl011_rx_chars(data);
+                }
+
+                // 处理调制解调器状态变化的中断
+                if status & (UART011_DSRMIS | UART011_DCDMIS |
+                    UART011_CTSMIS | UART011_RIMIS) != 0 {
+                    AmbaPl011Pops::pl011_modem_status(data);
+                }
+
+                // 处理发送字符的中断
+                if status & UART011_TXIS != 0 {
+                    AmbaPl011Pops::pl011_tx_chars(data, true);
+                }
+
+                // 如果处理循环次数达到限制，则退出循环
+                if pass_counter == 0 {
+                    break;
+                }
+
+                pass_counter -= 1;
+
+                // 重新读取中断状态以检查是否有新的中断发生
+                status = AmbaPl011Pops::pl011_read(data, Register::RegRis as usize) & pl011_data.im;
+
+                if status == 0 {
+                    break;
+                }
+            }
+            handled = true;
+        }
+
+        unsafe {
+            // 恢复之前保存的中断状态，并退出临界区
+            bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags);
+        }
+
+        if handled {
+            return irq::Return::Handled;
+        }
+        irq::Return::None
+    }
+}
+
+struct AmbaPl011Pops;
+
+impl AmbaPl011Pops {
+    fn pl011_reg_to_offset(reg: usize) -> usize {
+        PL011_STD_OFFSETS[reg] as usize
+    }
+
+    fn pl011_read(port: &UartPort, reg: usize) -> u32 {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
+        if u32::from(port_ptr.iotype) == UPIO_MEM32 {
+            unsafe { bindings::readl_relaxed(addr as _) }
+        } else {
+            unsafe { bindings::readw_relaxed(addr as _) as u32 }
+        }
+    }
+
+    /// pl011寄存器写入函数
+    fn pl011_write(val: u32, port: &UartPort, reg: usize) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
+
+        if u32::from(port_ptr.iotype) == UPIO_MEM32 {
+            unsafe { bindings::writel_relaxed(val as _, addr as _) };
+        } else {
+            unsafe { bindings::writew_relaxed(val as _, addr as _) };
+        }
+    }
+
+    fn pl011_rs485_tx_start(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut cr: u32 = 0;
+
+        cr = Self::pl011_read(port, Register::RegCr as usize);
+        cr |= UART011_CR_TXE;
+
+        if !(port_ptr.rs485.flags & SER_RS485_RX_DURING_TX) != 0 {
+            cr &= !UART011_CR_RXE;
+        }
+
+        if port_ptr.rs485.flags & SER_RS485_RTS_ON_SEND != 0 {
+            cr &= !UART011_CR_RTS;
+        } else {
+            cr |= UART011_CR_RTS;
+        }
+
+        Self::pl011_write(cr, port, Register::RegCr as usize);
+
+        let mut de: u64 = port_ptr.rs485.delay_rts_before_send as u64;
+        if de > 0 {
+            if de <= MAX_UDELAY_MS {
+                coarse_sleep(Duration::from_millis(de));
+            } else {
+                while de > 0 {
+                    coarse_sleep(Duration::from_millis(1));
+                    de -= 1;
+                }
+            }
+        }
+    }
+
+    fn pl011_stop_rx(port: &UartPort, pl011_data: &mut PL011Data) {
+        // 清除中断掩码寄存器 (IMSC) 中的接收相关中断位
+        pl011_data.im &= !(UART011_RXIM | UART011_RTIM | UART011_FEIM |
+            UART011_PEIM | UART011_BEIM | UART011_OEIM);
+
+        // 将修改后的中断掩码寄存器值写回到硬件寄存器中，以禁用接收中断
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+    }
+
+    fn pl011_hwinit(port: &UartPort, pl011_data: &mut PL011Data) -> Result {
+        // 可选地启用引脚复用并配置
+        /* pinctrl_pm_select_default_state(port->dev); */  // 未知!!!!! 怎么实现？
+
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let dev = unsafe { device::Device::new(port_ptr.dev) };
+
+        let clk = dev.clk_get().unwrap();
+
+        //尝试启用时钟
+        clk.prepare_enable()?;
+
+        // 获取时钟频率并保存到 uartclk 中
+        port_ptr.uartclk = clk.get_rate() as u32;
+        pr_info!("====Serial: uartclk is {}", port_ptr.uartclk);
+
+        // 清除未决的错误和接收中断
+        Self::pl011_write(UART011_OEIS | UART011_BEIS | UART011_PEIS |
+                              UART011_FEIS | UART011_RTIS | UART011_RXIS,
+                          port, Register::RegIcr as usize);
+
+        // 保存中断使能掩码，并启用 RX 中断以防万一用于 NMI 入口
+        pl011_data.im = Self::pl011_read(port, Register::RegImsc as usize);
+        Self::pl011_write(UART011_RTIM | UART011_RXIM, port, Register::RegImsc as usize);
+
+        // 未知!!!!! 怎么实现
+        // 如果有平台特定的数据，执行其初始化
+        // if (dev_get_platdata(uap->port.dev)) {
+        //     struct amba_pl011_data *plat;
+        //
+        //     plat = dev_get_platdata(uap->port.dev);
+        //     if (plat->init)
+        //     plat->init();
+        // }
+
+        Ok(())
+    }
+
+    fn pl011_fifo_to_tty(port: &UartPort) -> i32 {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut fifotaken = 0;
+        while fifotaken != 255 {
+            let status = Self::pl011_read(port, Register::RegFr as usize);
+            if status & UART01X_FR_RXFE != 0 {
+                break;
+            }
+
+            let mut ch = Self::pl011_read(port, Register::RegDr as usize);
+            let mut flag = bindings::TTY_NORMAL;
+            port_ptr.icount.rx += 1;
+
+            if ch & UART_DR_ERROR != 0 {
+                if ch & UART011_DR_BE != 0 {
+                    ch &= !(UART011_DR_FE | UART011_DR_PE);
+                    port_ptr.icount.brk += 1;
+                    if port.uart_handle_break() {
+                        continue;
+                    }
+                } else if ch & UART011_DR_PE != 0 {
+                    port_ptr.icount.parity += 1;
+                } else if ch & UART011_DR_FE != 0 {
+                    port_ptr.icount.frame += 1;
+                }
+
+                if ch & UART011_DR_OE != 0 {
+                    port_ptr.icount.overrun += 1;
+                }
+
+                ch &= port_ptr.read_status_mask;
+
+                if ch & UART011_DR_BE != 0 {
+                    flag = bindings::TTY_BREAK;
+                } else if ch & UART011_DR_PE != 0 {
+                    flag = bindings::TTY_PARITY;
+                } else if ch & UART011_DR_FE != 0 {
+                    flag = bindings::TTY_FRAME;
+                }
+            }
+
+            let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!! 转化问题疑问
+            unsafe { bindings::_raw_spin_unlock(&(*union_ptr).rlock as *const _ as *mut _); }
+
+            let sysrq = port.uart_handle_sysrq_char(ch as u8 & 255);
+
+
+            unsafe {
+                bindings::_raw_spin_lock(&(*union_ptr).rlock as *const _ as *mut _);
+            }
+
+            if !sysrq {
+                unsafe {
+                    bindings::uart_insert_char(
+                        port.as_ptr(),
+                        ch,
+                        UART011_DR_OE,
+                        ch as u8,
+                        flag as u8,
+                    );
+                }
+            }
+        }
+        return fifotaken;
+    }
+
+    fn check_apply_cts_event_workaround(port: &UartPort) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        if !pl011_data.vendor.cts_event_workaround {
+            return;
+        }
+
+        // 确保所有位都被解锁
+        Self::pl011_write(0x00, port, Register::RegIcr as usize);
+
+        // 解决方法：在写 1 清除（W1C）之前引入 26 纳秒（1 个 UART 时钟）的延迟；
+        // 单次 APB 访问会引入 2 个 PCLK（133.12MHz）的延迟，
+        // 因此添加 2 次虚拟读取。
+        Self::pl011_read(port, Register::RegIcr as usize);
+        Self::pl011_read(port, Register::RegIcr as usize);
+    }
+
+    fn pl011_rx_chars(port: &UartPort) {
+        Self::pl011_fifo_to_tty(port);
+
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        unsafe { bindings::_raw_spin_unlock(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        // unsafe { bindings::tty_flip_buffer_push((*port_ptr.state).port) };  // 未知!!!!!  怎么实现
+
+        unsafe {
+            bindings::_raw_spin_lock(&(*union_ptr).rlock as *const _ as *mut _);
+        }
+    }
+
+    fn pl011_modem_status(port: &UartPort) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        // 读取调制解调器状态寄存器的值，并与调制解调器状态掩码进行按位与操作
+        let status = Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_MODEM_ANY;
+
+        // 计算当前状态与之前保存的状态之间的变化
+        let delta = status ^ pl011_data.old_status;
+
+        // 更新保存的状态为当前状态
+        pl011_data.old_status = status;
+
+        // 如果没有状态变化，直接返回
+        if !delta != 0 {
+            return;
+        }
+
+        // 如果数据载体检测(DCD)信号有变化，处理DCD信号变化
+        if delta & UART01X_FR_DCD != 0 {
+            unsafe { bindings::uart_handle_dcd_change(port.as_ptr(), status & UART01X_FR_DCD != 0) };
+        }
+
+        // 如果数据集就绪(DSR)信号有变化，更新DSR信号计数
+        if delta & pl011_data.vendor.fr_dsr != 0 {
+            port_ptr.icount.dsr += 1;
+        }
+
+        // 如果清除发送(CTS)信号有变化，处理CTS信号变化
+        if delta & pl011_data.vendor.fr_cts != 0 {
+            unsafe { bindings::uart_handle_cts_change(port.as_ptr(), status & pl011_data.vendor.fr_cts != 0) };
+        }
+        unsafe {
+            let wait_queue: *mut bindings::wait_queue_head = &mut (*port_ptr.state).port.delta_msr_wait as *mut _;
+            let key: *mut c_void = ptr::null_mut();
+            // 唤醒等待调制解调器状态变化的进程
+
+            bindings::__wake_up(wait_queue, TASK_INTERRUPTIBLE, 1, key);
+        }
+    }
+
+    fn pl011_tx_char(port: &UartPort, c: u8, from_irq: bool) -> bool {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        // 检查如果不是从中断上下文调用，并且 UART 的发送 FIFO 已满，则无法发送字符
+        if !from_irq && (Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_TXFF != 0) {
+            return false; // 无法发送字符
+        }
+
+        // 将字符写入 UART 数据寄存器
+        Self::pl011_write(c as _, port, Register::RegDr as usize);
+
+        // 内存屏障，确保写操作按顺序执行
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);  // 未知!!!!!  需理解
+
+        // 更新发送计数
+        port_ptr.icount.tx += 1;
+
+        // 返回 true 表示字符已成功发送
+        return true;
+    }
+
+    fn pl011_stop_tx(port: &UartPort) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        // 清除发送中断使能位
+        pl011_data.im &= !UART011_TXIM;
+
+        // 将更新后的中断屏蔽寄存器值写回到硬件寄存器
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+    }
+
+    fn pl011_tx_chars(port: &UartPort, from_irq: bool) -> bool {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        // 获取指向 UART 发送缓冲区的指针
+        let mut xmit = unsafe { (*port_ptr.state).xmit };
+
+        // 计算一次传输的最大字符数，通常为 FIFO 大小的一半
+        let mut count = pl011_data.fifosize >> 1;
+
+        // 如果有要立即发送的字符（x_char），优先发送它
+        if port_ptr.x_char != 0 {
+            if !Self::pl011_tx_char(port, port_ptr.x_char as _, from_irq) {
+                return true;  // 发送成功，返回 true
+            }
+
+            port_ptr.x_char = 0;  // 清空 x_char
+            count -= 1;  // 减少发送计数
+        }
+
+        fn uart_circ_empty(circ: &bindings::circ_buf) -> bool {
+            circ.head == circ.tail
+        }
+
+        fn uart_circ_chars_pending(circ: &bindings::circ_buf) -> i32 {
+            (circ.head - circ.tail) & (UART_XMIT_SIZE - 1)
+        }
+
+        // 如果缓冲区为空或 UART 停止传输，停止发送
+        if uart_circ_empty(&xmit) || port.uart_tx_stopped() {
+            Self::pl011_stop_tx(port);
+            return false;
+        }
+
+        // 循环发送字符，直到缓冲区为空或达到发送计数限制
+        loop {
+            // 如果来自中断且发送计数为 0，退出循环
+            if from_irq && count == 0 {
+                break;
+            }
+            count -= 1;
+
+            // 如果来自中断且发送计数为 0 且 FIFO 已满，退出循环
+            if from_irq && count == 0 &&
+                Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_TXFF != 0 {
+                break;
+            }
+
+            let c = unsafe { *xmit.buf.wrapping_add(xmit.tail as usize) }; // 获取字符
+            // 发送一个字符，如果发送失败，退出循环
+            if !Self::pl011_tx_char(port, c.try_into().unwrap(), from_irq) {
+                break;
+            }
+
+            // 更新环形缓冲区的尾部指针
+            xmit.tail = (xmit.tail + 1) & (UART_XMIT_SIZE - 1);
+
+            // 缓冲区为空退出循环
+            if uart_circ_empty(&xmit) {
+                break;
+            }
+        }
+
+        // 如果缓冲区中待发送的字符数少于 WAKEUP_CHARS，唤醒写进程
+        if uart_circ_chars_pending(&xmit) < WAKEUP_CHARS {
+            unsafe { bindings::uart_write_wakeup(port.as_ptr()) };
+        }
+
+        // 如果缓冲区为空，停止发送
+        if uart_circ_empty(&xmit) {
+            Self::pl011_stop_tx(port);
+            return false;
+        }
+
+        // 返回 true 表示仍有字符待发送
+        return true;
+    }
+
+    fn request_irq(irq: u32, data: Box<UartPort>) -> Result<irq::Registration<Pl011Handler>> {
+        irq::Registration::try_new(irq, data, irq::flags::SHARED, fmt!("uart-pl011"))
+    }
+
+    fn pl011_allocate_irq(port: &UartPort, pl011_data: &mut PL011Data) -> Result<irq::Registration<Pl011Handler>> {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+        Self::request_irq(port_ptr.irq, Box::try_new(*port)?)
+    }
+
+    fn pl011_enable_interrupts(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
+        let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        Self::pl011_write(UART011_RTIS | UART011_RXIS, port, Register::RegIcr as usize);
+
+        for i in 0..pl011_data.fifosize * 2 {
+            // 读取状态寄存器并检查接收 FIFO 是否为空
+            if Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_RXFE != 0 {
+                break;
+            }
+
+            // 读取数据寄存器
+            Self::pl011_read(port, Register::RegDr as usize);
+        }
+
+        pl011_data.im = UART011_RTIM | UART011_RXIM;
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+
+        // 恢复之前保存的中断状态，并退出临界区
+        unsafe { bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags) };
+    }
+
+    fn pl011_disable_interrupts(port: &UartPort, pl011_data: &mut PL011Data) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 加锁以保护对 CR 寄存器的访问
+        unsafe { bindings::_raw_spin_lock(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        pl011_data.im = 0;
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+        Self::pl011_write(0xffff, port, Register::RegIcr as usize);
+
+        // 解锁
+        unsafe { bindings::_raw_spin_unlock(&(*union_ptr).rlock as *const _ as *mut _); }
+    }
+
+    fn pl011_rs485_tx_stop(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        let max_tx_drain_iters: i32 = (port_ptr.fifosize * 2).try_into().unwrap();
+        let mut i = 0;
+
+        while !Self::tx_empty(port) != 0 {
+            if i > max_tx_drain_iters {
+                unsafe { dev_warn!(device::Device::new(port_ptr.dev), "timeout while draining hardware tx queue\n"); }
+                break;
+            }
+
+            coarse_sleep(Duration::from_nanos(pl011_data.rs485_tx_drain_interval * 1000));
+            i += 1;
+        }
+
+        if port_ptr.rs485.delay_rts_after_send != 0 {
+            coarse_sleep(Duration::from_millis(port_ptr.rs485.delay_rts_after_send as _));
+        }
+
+        let mut cr = Self::pl011_read(port, Register::RegCr as usize);
+
+        if port_ptr.rs485.flags & SER_RS485_RTS_AFTER_SEND != 0 {
+            cr &= !UART011_CR_RTS;
+        } else {
+            cr |= UART011_CR_RTS;
+        }
+
+        /* Disable the transmitter and reenable the transceiver */
+        cr &= !UART011_CR_TXE;
+        cr |= UART011_CR_RXE;
+        Self::pl011_write(cr, port, Register::RegCr as usize);
+
+        pl011_data.rs485_tx_started = false;
+    }
+
+    fn pl011_shutdown_channel(port: &UartPort, lcrh: usize) {
+        let mut val = Self::pl011_read(port, lcrh);
+        val &= !(UART01X_LCRH_BRK | UART01X_LCRH_FEN);
+        Self::pl011_write(val, port, lcrh);
+    }
+
+    fn pl011_split_lcrh(port: &UartPort) -> bool {
+        Self::pl011_reg_to_offset(Register::RegLcrhRx as usize) !=
+            Self::pl011_reg_to_offset(Register::RegLcrhTx as usize)
+    }
+
+    fn pl011_disable_uart(port: &UartPort) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+
+        port_ptr.status &= !(UPSTAT_AUTOCTS | UPSTAT_AUTORTS);
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 加锁以保护对 CR 寄存器的访问
+        unsafe { bindings::_raw_spin_lock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        let mut cr = Self::pl011_read(port, Register::RegCr as usize);
+        cr &= UART011_CR_RTS | UART011_CR_DTR;
+        cr |= UART01X_CR_UARTEN | UART011_CR_TXE;
+        Self::pl011_write(cr, port, Register::RegCr as usize);
+
+        // 解锁
+        unsafe { bindings::_raw_spin_unlock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        /*
+	    * disable break condition and fifos
+	    */
+        Self::pl011_shutdown_channel(port, Register::RegLcrhRx as usize);
+        if Self::pl011_split_lcrh(port) {
+            Self::pl011_shutdown_channel(port, Register::RegLcrhTx as usize);
+        }
+    }
+
+    fn pl011_setup_status_masks(port: &UartPort, new: *mut bindings::ktermios) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+
+        port_ptr.read_status_mask = UART011_DR_OE | 255;
+
+        if unsafe { (*new).c_iflag & bindings::INPCK != 0 } {
+            port_ptr.read_status_mask |= UART011_DR_FE | UART011_DR_PE;
+        }
+        if unsafe { (*new).c_iflag & (bindings::IGNBRK | bindings::BRKINT | bindings::PARMRK) != 0 } {
+            port_ptr.read_status_mask |= UART011_DR_BE;
+        }
+
+        /*
+         * Characters to ignore
+         */
+        port_ptr.ignore_status_mask = 0;
+        if unsafe { (*new).c_iflag & bindings::IGNPAR != 0 } {
+            port_ptr.ignore_status_mask |= UART011_DR_FE | UART011_DR_PE;
+        }
+
+        if unsafe { (*new).c_iflag & bindings::IGNBRK != 0} {
+            port_ptr.ignore_status_mask |= UART011_DR_BE;
+            /*
+             * If we're ignoring parity and break indicators,
+             * ignore overruns too (for real raw support).
+             */
+            if unsafe { (*new).c_iflag & bindings::IGNPAR != 0} {
+                port_ptr.ignore_status_mask |= UART011_DR_OE;
+            }
+        }
+
+        /*
+         * Ignore all characters if CREAD is not set.
+         */
+        if unsafe { (*new).c_cflag & bindings::CREAD == 0 } {
+            port_ptr.ignore_status_mask |= UART_DUMMY_DR_RX;
+        }
+    }
+
+    fn pl011_enable_ms(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        // 启用调制解调器状态中断，包括环路指示器 (UART011_RIMIM)、
+        // 清除发送 (UART011_CTSMIM)、数据载波检测 (UART011_DCDMIM) 和数据终端就绪 (UART011_DSRMIM)
+        pl011_data.im |= UART011_RIMIM | UART011_CTSMIM | UART011_DCDMIM | UART011_DSRMIM;
+
+        // 将中断掩码写入 IMSC 寄存器
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+    }
+
+    fn pl011_write_lcr_h(port: &UartPort, lcr_h: u32){
+        Self::pl011_write(lcr_h, port, Register::RegLcrhRx as usize);
+        if Self::pl011_split_lcrh(port){
+            /*
+             * Wait 10 PCLKs before writing LCRH_TX register,
+             * to get this delay write read only register 10 times
+             */
+
+            for i in 0..10{
+                Self::pl011_write(0xff, port, Register::RegMis as usize);
+            }
+            Self::pl011_write(lcr_h, port, Register::RegLcrhTx as usize);
+        }
+    }
+
+}
+
+#[vtable]
+impl UartPortOps for AmbaPl011Pops {
+    type Data = Box<PL011Data>;
+
+    /// * @tx_empty:      check if the UART TX FIFO is empty
+    fn tx_empty(port: &UartPort) -> u32 {
+        let status = Self::pl011_read(port, Register::RegFr as usize) ^ VENDOR_DATA.inv_fr;
+        if status & (VENDOR_DATA.fr_busy | UART01X_FR_TXFF) == 1 {
+            0
+        } else {
+            TIOCSER_TEMT as u32
+        }
+    }
+
+    /// * @set_mctrl:    set the modem control register
+    fn set_mctrl(port: &UartPort, mctrl: u32) {
+        // 读取当前的控制寄存器值
+        let mut cr = Self::pl011_read(port, Register::RegCr as usize);
+
+        // 辅助函数用于设置或清除寄存器位
+        let set_or_clear_bit = |current_cr: u32, mctrl_bit: u32, reg_bit: u32| {
+            if mctrl & mctrl_bit != 0 {
+                current_cr | reg_bit // 设置位
+            } else {
+                current_cr & !reg_bit // 清除位
+            }
+        };
+
+        // 更新控制寄存器的各个位
+        cr = set_or_clear_bit(cr, TIOCM_RTS, UART011_CR_RTS);
+        cr = set_or_clear_bit(cr, TIOCM_DTR, UART011_CR_DTR);
+        cr = set_or_clear_bit(cr, TIOCM_OUT1, UART011_CR_OUT1);
+        cr = set_or_clear_bit(cr, TIOCM_OUT2, UART011_CR_OUT2);
+        cr = set_or_clear_bit(cr, TIOCM_LOOP, UART011_CR_LBE);
+
+        let port_ptr = unsafe { &*port.as_ptr() };
+        // 如果启用了自动 RTS 控制，检查是否需要禁用自动 RTS
+        if port_ptr.status & UPSTAT_AUTORTS != 0 {
+            cr &= !UART011_CR_RTSEN; // 清除 RTSEN 位
+        }
+
+        // 将更新后的控制寄存器值写回到硬件
+        Self::pl011_write(cr, port, Register::RegCr as usize);
+    }
+
+    /// * @get_mctrl:    get the modem control register
+    fn get_mctrl(port: &UartPort) -> u32 {
+        let mut result: u32 = 0;
+        let status = Self::pl011_read(port, Register::RegFr as usize);
+
+        let get_or_clear_bit = |current_result: u32, mctrl_bit: u32, reg_bit: u32| {
+            if status & mctrl_bit != 0 {
+                current_result | reg_bit // 设置位
+            } else {
+                current_result
+            }
+        };
+
+        result = get_or_clear_bit(result, UART01X_FR_DCD, TIOCM_CAR);
+        result = get_or_clear_bit(result, VENDOR_DATA.fr_dsr, TIOCM_DSR);
+        result = get_or_clear_bit(result, VENDOR_DATA.fr_cts, TIOCM_CTS);
+        result = get_or_clear_bit(result, VENDOR_DATA.fr_ri, TIOCM_RNG);
+
+        result
+    }
+
+    /// * @stop_tx:      stop transmitting
+    fn stop_tx(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        pl011_data.im &= !UART011_TXIM;
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+    }
+
+    /// * @start_tx:    start transmitting
+    fn start_tx(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        if ((port_ptr.rs485.flags & SER_RS485_ENABLED) != 0) && !pl011_data.rs485_tx_started {
+            Self::pl011_rs485_tx_start(port);
+            pl011_data.rs485_tx_started = true;
+        }
+    }
+
+    /// * @throttle:     stop receiving
+    fn throttle(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
+        let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        // 停止 UART 的接收操作
+        Self::pl011_stop_rx(port, pl011_data.as_mut());
+
+        unsafe {
+            // 恢复之前保存的中断状态，并退出临界区
+            bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags);
+        }
+    }
+
+    /// * @unthrottle:   start receiving
+    fn unthrottle(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
+        let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        // 设置中断掩码，启用接收中断 (UART011_RXIM) 和接收定时中断 (UART011_RTIM)
+        pl011_data.im = UART011_RTIM | UART011_RXIM;
+        // 将中断掩码写入 IMSC 寄存器
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+
+        unsafe {
+            // 恢复之前保存的中断状态，并退出临界区
+            bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags);
+        }
+    }
+
+    /// * @send_xchar:  send a break character
+    fn send_xchar(_port: &UartPort, ch: i8) {
+        todo!();
+    }
+
+    /// * @stop_rx:      stop receiving
+    fn stop_rx(_port: &UartPort) {
+        todo!();
+    }
+
+    /// * @start_rx:    start receiving
+    fn start_rx(_port: &UartPort) {
+        todo!();
+    }
+
+    /// * @enable_ms:    enable modem status interrupts
+    fn enable_ms(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        // 启用调制解调器状态中断，包括环路指示器 (UART011_RIMIM)、
+        // 清除发送 (UART011_CTSMIM)、数据载波检测 (UART011_DCDMIM) 和数据终端就绪 (UART011_DSRMIM)
+        pl011_data.im |= UART011_RIMIM | UART011_CTSMIM | UART011_DCDMIM | UART011_DSRMIM;
+        // 将中断掩码写入 IMSC 寄存器
+        Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+    }
+
+    /// * @break_ctl:   set the break control
+    fn break_ctl(port: &UartPort, ctl: i32) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
+        let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        // 读取当前 LCRH_TX 寄存器的值
+        let mut lcr_h = Self::pl011_read(port, Register::RegLcrhTx as usize);
+        // 根据 ctl 的值设置或清除 LCRH 寄存器中的 Break 位
+        if ctl == -1 {
+            lcr_h |= UART01X_LCRH_BRK;
+        } else {
+            lcr_h &= !UART01X_LCRH_BRK;
+        }
+
+        // 将修改后的 LCRH 值写回寄存器
+        Self::pl011_write(lcr_h, port, Register::RegLcrhTx as usize);
+
+        // 恢复之前保存的中断状态，并退出临界区
+        unsafe { bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags) };
+    }
+
+    /// * @startup:      start the UART
+    fn startup(port: &UartPort) -> i32 {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        // 初始化硬件
+        if let Err(_) = Self::pl011_hwinit(port, pl011_data.as_mut()) {
+            // clk_disable_unprepare(uap->clk); // 未知!!!!! 好像drop自动实现
+            return 1;
+        }
+
+        // 分配中断
+        if let Err(_) = Self::pl011_allocate_irq(port, pl011_data.as_mut()) {
+            // clk_disable_unprepare(uap->clk); // 未知!!!!! 好像drop自动实现
+            return 1;
+        }
+
+        // 配置 FIFO 水平
+        Self::pl011_write(pl011_data.vendor.ifls, port, Register::RegIfls as usize);
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 加锁以保护对 CR 寄存器的访问
+        unsafe { bindings::_raw_spin_lock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        // 读取当前 CR 寄存器的值
+        let mut cr = Self::pl011_read(port, Register::RegCr as usize);
+        cr &= UART011_CR_RTS | UART011_CR_DTR;
+        cr |= UART01X_CR_UARTEN | UART011_CR_RXE;
+
+        // 如果 RS485 模式未启用，启用 TX
+        if port_ptr.rs485.flags & SER_RS485_ENABLED == 0 {
+            cr |= UART011_CR_TXE;
+        }
+
+        // 写回 CR 寄存器
+        Self::pl011_write(cr, port, Register::RegCr as usize);
+
+        // 解锁
+        unsafe { bindings::_raw_spin_unlock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
+
+        // 初始化调制解调器信号的旧状态
+        pl011_data.old_status = Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_MODEM_ANY;
+
+        // 启用中断
+        Self::pl011_enable_interrupts(port);
+
+        0
+    }
+
+    /// * @shutdown:     shutdown the UART
+    fn shutdown(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        Self::pl011_disable_interrupts(port, pl011_data.as_mut());
+
+        if port_ptr.rs485.flags & SER_RS485_ENABLED != 0 && pl011_data.rs485_tx_started {
+            Self::pl011_rs485_tx_stop(port);
+        }
+
+        // free_irq(uap->port.irq, uap); // 未知!!!!! 好像drop自动实现
+
+        Self::pl011_disable_uart(port);
+
+
+        /*
+         * Shut down the clock producer
+         */
+        // clk_disable_unprepare(uap->clk);  // 未知!!!!! 好像drop自动实现
+
+        /* Optionally let pins go into sleep states */
+        // pinctrl_pm_select_sleep_state(port->dev);  // 未知!!!!! 怎么实现？
+
+        //  未知!!!!! 怎么实现？
+        // if (dev_get_platdata(uap->port.dev)) {
+        //     struct amba_pl011_data *plat;
+        //
+        //     plat = dev_get_platdata(uap->port.dev);
+        //     if (plat->exit)
+        //     plat->exit();
+        // }
+
+        unsafe {
+            if let Some(flush_buffer_fn) = (*port_ptr.ops).flush_buffer {
+                flush_buffer_fn(port.as_ptr());
+            }
+        }
+    }
+
+    /// * @flush_buffer: flush the UART buffer
+    fn flush_buffer(_port: &UartPort) {}
+
+    /// * @set_termios: set the termios structure
+    fn set_termios(
+        port: &UartPort,
+        new: *mut bindings::ktermios,
+        old: *const bindings::ktermios,
+    ) {
+        let mut port_ptr = unsafe { &mut *port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        let mut clkdiv: u32 = 0;
+        // 根据是否支持过采样来设置时钟分频器
+        if pl011_data.vendor.oversampling {
+            clkdiv = 8;
+        } else {
+            clkdiv = 16;
+        }
+
+        /*
+         * 请求核心函数为我们计算分频器
+         */
+        let baud = unsafe {
+            bindings::uart_get_baud_rate(port.as_ptr(), new, old, 0,
+                                         port_ptr.uartclk / clkdiv)
+        };
+
+        fn div_round_closest(x: u32, divisor: u32) -> u32 {
+            (x + (divisor / 2)) / divisor     // 未知!!!!!  可能有错
+        }
+
+        let mut quot: u32 = 0;
+        // 根据波特率计算分频器
+        if baud > port_ptr.uartclk / 16 {
+            quot = div_round_closest(port_ptr.uartclk * 8, baud);
+        } else {
+            quot = div_round_closest(port_ptr.uartclk * 4, baud);
+        }
+
+        // 根据 c_cflag 设置数据位
+        let mut lcr_h: u32 = unsafe {
+            match (*new).c_cflag & bindings::CSIZE {
+                bindings::CS5 => UART01X_LCRH_WLEN_5,
+                bindings::CS6 => UART01X_LCRH_WLEN_6,
+                bindings::CS7 => UART01X_LCRH_WLEN_7,
+                _ => UART01X_LCRH_WLEN_8,
+            }
+        };
+
+        // 设置停止位
+        if unsafe { (*new).c_cflag & bindings::CSTOPB != 0 } {
+            lcr_h |= UART01X_LCRH_STP2;
+        }
+
+        // 设置校验位
+        if unsafe { (*new).c_cflag & bindings::PARENB != 0 } {
+            lcr_h |= UART01X_LCRH_PEN;
+
+            if unsafe { !((*new).c_cflag & bindings::PARODD) != 0 } {
+                lcr_h |= UART01X_LCRH_EPS;
+            }
+
+            if unsafe { (*new).c_cflag & bindings::CMSPAR != 0 } {
+                lcr_h |= UART011_LCRH_SPS;
+            }
+        }
+
+        // 如果 FIFO 大小大于 1，启用 FIFO
+        if pl011_data.fifosize > 1 {
+            lcr_h |= UART01X_LCRH_FEN;
+        }
+
+        // 获取帧大小
+        let bits = unsafe { bindings::tty_get_frame_size((*new).c_cflag) };
+
+        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        // 保护代码块，禁止中断
+        let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
+
+        /*
+         * 更新每个端口的超时
+         */
+        unsafe { bindings::uart_update_timeout(port.as_ptr(), (*new).c_cflag, baud) };
+
+        fn div_round_up(n: u32, d: u32) -> u32 {
+            assert!(d > 0, "divisor must be greater than zero");
+            (n + d - 1) / d
+        }
+
+        /*
+        * 计算发送一个字符所需的时间。我们在等待传输队列为空时使用此轮询间隔
+        */
+        pl011_data.rs485_tx_drain_interval = div_round_up((bits as u32) * 1000 * 1000,
+                                                          baud as u32) as u64;
+
+        // 设置状态掩码
+        Self::pl011_setup_status_masks(port, new);
+
+        // 如果启用调制解调器状态信号
+        if unsafe {port_ptr.flags & UPF_HARDPPS_CD != 0 || (*new).c_cflag & bindings::CRTSCTS != 0 || !((*new).c_cflag & bindings::CLOCAL) != 0}{
+            Self::pl011_enable_ms(port);
+        }
+
+        // 如果启用 RS485，禁用 CRTSCTS
+        if port_ptr.rs485.flags & SER_RS485_ENABLED !=0 {
+            unsafe {(*new).c_cflag  &= !bindings::CRTSCTS}
+        }
+
+        // 读取当前控制寄存器的值
+        let mut old_cr = Self::pl011_read(port, Register::RegCr as usize);
+
+        // 根据 c_cflag 设置硬件流控制
+        if unsafe { (*new).c_cflag & bindings::CRTSCTS != 0} {
+            if old_cr & UART011_CR_RTS != 0 {
+                old_cr |= UART011_CR_RTSEN;
+            }
+
+            old_cr |= UART011_CR_CTSEN;
+            port_ptr.status |= UPSTAT_AUTOCTS | UPSTAT_AUTORTS;
+        } else {
+            old_cr &= !(UART011_CR_CTSEN | UART011_CR_RTSEN);
+            port_ptr.status &= !(UPSTAT_AUTOCTS | UPSTAT_AUTORTS);
+        }
+
+        // 如果vendor支持过采样，调整控制寄存器的过采样位
+        if pl011_data.vendor.oversampling {
+            if baud > port_ptr.uartclk / 16{
+                old_cr |= ST_UART011_CR_OVSFACT;
+            } else {
+                old_cr &= !ST_UART011_CR_OVSFACT;
+            }
+        }
+
+        /*
+         * 对于 ST Micro 过采样变体，通过降低分频器略微增加比特率，以避免高速度下采样延迟导致的数据损坏。
+         */
+        if pl011_data.vendor.oversampling {
+            if (baud >= 3000000) && (baud < 3250000) && (quot > 1){
+                quot -= 1;
+            } else if (baud > 3250000) && (quot > 2){
+                quot -= 2;
+            }
+        }
+
+        // 设置波特率
+        Self::pl011_write(quot & 0x3f, port, Register::RegFbrd as usize);
+        Self::pl011_write(quot >> 6, port, Register::RegIbrd as usize);
+
+        /*
+         * NOTE: 必须在 REG_FBRD 和 REG_IBRD 之后写入 REG_LCRH_TX 和 REG_LCRH_RX。
+         */
+        Self::pl011_write_lcr_h(port, lcr_h);
+
+        /*
+         * 接收已被 pl011_disable_uart 在关闭期间禁用。如果你需要使用 tty_driver 在 tty_find_polling_driver() 后返回，则需要重新启用接收。
+         */
+        old_cr |= UART011_CR_RXE;
+        Self::pl011_write(old_cr, port, Register::RegCr as usize);
+
+        // 释放代码块，允许中断
+        unsafe { bindings::_raw_spin_unlock_irqrestore(&(*union_ptr).rlock as *const _ as *mut _, flags) };
+    }
+
+    /// * @set_ldisc:    set the line discipline
+    fn set_ldisc(_port: &UartPort, _arg2: *mut bindings::ktermios) {
+        todo!();
+    }
+
+    /// * @pm:            power management
+    fn pm(_port: &UartPort, _state: u32, _oldstate: u32) {
+        todo!();
+    }
+
+    /// * @type:          get the type of the UART
+    fn port_type(_port: &UartPort) -> *const i8 {
+        todo!();
+    }
+
+    /// * @release_port: release the UART port
+    fn release_port(uart_port: &UartPort) {
+        todo!();
+    }
+
+    /// * @request_port: request the UART port
+    fn request_port(uart_port: &UartPort) -> i32 {
+        todo!();
+    }
+
+    /// * @config_port:  configure the UART port
+    fn config_port(uart_port: &UartPort, flags: i32) {
+        todo!();
+    }
+
+    /// * @verify_port:  verify the UART port
+    fn verify_port(uart_port: &UartPort, ser: *mut bindings::serial_struct) -> i32 {
+        todo!();
+    }
+
+    /// * @ioctl:        ioctl handler
+    fn ioctl(uart_port: &UartPort, arg2: u32, arg3: u64) -> i32 {
+        todo!();
+    }
+
+    /// #[cfg(CONFIG_CONSOLE_POLL)]
+    fn poll_init(uart_port: &UartPort) -> i32 {
+        todo!();
+    }
+    /// #[cfg(CONFIG_CONSOLE_POLL)]
+    fn poll_put_char(uart_port: &UartPort, arg2: u8) {
+        todo!();
+    }
+    /// #[cfg(CONFIG_CONSOLE_POLL)]
+    fn poll_get_char(uart_port: &UartPort) -> i32 {
+        todo!();
+    }
+}
+
+// 定义AMBA ID表
 kernel::define_amba_id_table! {MY_AMDA_ID_TABLE, (), [
     ({id: 0x00041011, mask: 0x000fffff}, None),
 ]}
-// Linux Raw id table
+// 定义模块的AMBA ID表
 kernel::module_amba_id_table!(UART_MOD_TABLE, MY_AMDA_ID_TABLE);
 
+// PL011设备的结构体
 struct PL011Device;
+// 实现AMBA驱动程序接口
 impl amba::Driver for PL011Device {
-    // type Data = Arc<DeviceData>;
-
+    // AMBA ID表
     kernel::driver_amba_id_table!(MY_AMDA_ID_TABLE);
+    // 探测函数
     fn probe(adev: &mut amba::Device, _data: Option<&Self::IdInfo>) -> Result {
         dev_info!(adev,"{} PL061 GPIO chip (probe)\n",adev.name());
         dbg!("********** PL061 GPIO chip (probe) *********\n");
 
-        let dev = device::Device::from_dev(adev);
+        // let dev = device::Device::from_dev(adev);
 
+        // 查找可用的端口号
         let portnr = pl011_find_free_port()?;
         dev_info!(adev,"portnr is {}\n",portnr);
-        let clk = dev.clk_get().unwrap();  // 获得clk
-        let fifosize = if adev.revision_get().unwrap() < 3 {16} else {32};
+
+        // 获取时钟
+        // let clk = dev.clk_get().unwrap();
+        // 确定FIFO大小
+        let fifosize = if adev.revision_get().unwrap() < 3 { 16 } else { 32 };
+        // 设置IO类型
         let iotype = UPIO_MEM as u8;
+        // 获取寄存器基地址
         let reg_base = adev.take_resource().ok_or(ENXIO)?;
-        let reg_mem : IoMem<UART_SIZE>= unsafe { IoMem::try_new(&reg_base)?};
+        // 初始化IO内存
+        let reg_mem: IoMem<UART_SIZE> = unsafe { IoMem::try_new(&reg_base)? };
+        // 获取基地址的偏移量
         let mapbase = reg_base.get_offset();
+        // 获取内存基地址
         let membase = reg_mem.get();
+        // 获取中断号
         let irq = adev.irq(0).ok_or(ENXIO)?;
 
         dev_info!(adev,"fifosize is {}\n",fifosize);
         dev_info!(adev,"mapbase is 0x{:x}\n", mapbase);
         dev_info!(adev,"membase is 0x{:p}\n",membase);
         dev_info!(adev,"irq is {}\n",irq);
-        let has_sysrq = 1;
-        let flags = UPF_BOOT_AUTOCONF;
-        let port =  UartPort::new().setup(
-                membase, 
-                mapbase, 
-                irq,
-                iotype,
-                flags, 
-                has_sysrq,
-                fifosize,
-             portnr as _,
-            );     
 
-        dbg!("********* PL061 GPIO chip registered *********\n");
+        // 确定系统请求支持
+        let has_sysrq = 1;
+        // 设置标志
+        let flags = UPF_BOOT_AUTOCONF;
+        // 创建并设置串口端口
+        // let mut uap = UartPort::new();
+
+        // // uap.vendor = &VENDOR_DATA;
+        // uap.fifosize = fifosize;
+        //
+
+        let mut type_: [u8; 12] = [0; 12];
+        // 设置端口类型
+        let rev = adev.revision_get().unwrap();
+        let type_str = CString::try_from_fmt(fmt!("PL011 rev{}", rev)).unwrap();
+        // 将格式化的字符串复制到 uap.type 中
+        let bytes = type_str.as_bytes_with_nul(); // 包含 NUL 终止符
+        let len = bytes.len().min(type_.len());
+        type_[..len].copy_from_slice(&bytes[..len]);
+        // 手动填充剩余部分为 0
+        for byte in &mut type_[len..] {
+            *byte = 0;
+        }
+
+        let pl011_data = PL011Data {
+            reg_offset: VENDOR_DATA.reg_offset,
+            im: 0,
+            old_status: 0,
+            fifosize,
+            fixed_baud: 0,
+            type_: type_,
+            vendor: VENDOR_DATA,
+            rs485_tx_started: false,
+            rs485_tx_drain_interval: 0,
+        };
+
+        let pl011_resources = PL011Resources {
+            base: reg_mem,
+            parent_irq: irq,
+        };
+
+        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(
+            membase,
+            mapbase,
+            irq,
+            iotype,
+            flags,
+            has_sysrq,
+            fifosize,
+            portnr as _,
+        );
+
+        let pl011_registrations_pin = pin!(pl011_registrations);
+
+        // let pl011_device_data = new_device_data!(&pl011_registrations_pin, &pl011_resources, &pl011_data, "ttyAMA")?;
+
+        pl011_registrations_pin.register(
+            adev,
+            &UART_DRIVER,
+            portnr as _,
+            Box::try_new(pl011_data)?,
+        )?;
+
+        dbg!("********* PL061 GPIO芯片已注册 *********\n");
         Ok(())
     }
 }
 
+// 注册AMBA驱动程序
 module_amba_driver! {
     type: PL011Device,
     name: "pl011_uart",
-    author: "Tang hanwen",
+    author: "Tang Hanwen",
     license: "GPL",
     initcall: "arch",
 }
 
-/// Find available driver ports sequentially.
-fn pl011_find_free_port() -> Result<usize>{
+/// 查找可用的驱动端口。
+fn pl011_find_free_port() -> Result<usize> {
     for (index, port) in unsafe { PORTS.iter().enumerate() } {
         if let None = port {
-            return Ok(index)
+            return Ok(index);
         }
     }
-    return Err(EBUSY);
+    Err(EBUSY)
 }
-
-/// pl011 register write
-fn pl011_write(val:u32, membase: *mut u8, reg: usize, iotype: u8) {
-    let addr = membase.wrapping_add(reg);
-    if iotype == UPIO_MEM32 as u8 {
-        unsafe {bindings::writel_relaxed(val as _, addr as _)};
-    } else {
-        unsafe { bindings::writew_relaxed(val as _, addr as _)};
-    }
-
-}
-
 

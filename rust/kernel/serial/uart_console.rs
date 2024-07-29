@@ -1,26 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Support for uart console.
+//! 支持UART控制台。
 //!
-//! C header: ['include/linux/console.h']
-
-// use super::uart_port::UartPort;
+//! C头文件: ['include/linux/console.h']
 
 use crate::{
-    bindings,
-    error::{Result, from_result},
-    types::ForeignOwnable,
+    bindings,  // 内核绑定
+    error::{Result, from_result},  // 错误处理模块，包括结果类型和错误转换函数
+    types::ForeignOwnable,  // 类型模块，包含外部所有权类型
 };
 
-use core::mem::MaybeUninit;
+use core::mem::MaybeUninit;  // 导入可能未初始化的内存模块
 
+use macros::vtable;  // 导入虚表宏
 
-use macros::vtable;
-
-/// General Console Flags associated with a [`Console`].
-/// Bitmask for access mode flags.
+/// 与[`Console`]关联的一般控制台标志。
+/// 访问模式标志的位掩码。
 ///
-/// # Examples
+/// # 示例
 ///
 /// ```
 /// use kernel::serial::uart_console;
@@ -31,73 +28,70 @@ use macros::vtable;
 /// }
 /// ```
 pub mod flags {
-    /// File is opened in append mode.
+    /// 文件以追加模式打开。
     pub const CON_PRINTBUFFER: u32 = bindings::cons_flags_CON_PRINTBUFFER;
 
-    /// Indicates that the console driver is backing.
+    /// 表示控制台驱动程序正在备份。
     pub const CON_CONSDEV: u32 = bindings::cons_flags_CON_CONSDEV;
 
-    /// Indicates if a console is allowed to print records. 
+    /// 表示是否允许控制台打印记录。
     pub const CON_ENABLED: u32 = bindings::cons_flags_CON_ENABLED;
 
-    /// Marks the console driver as early console driver which
- 	/// is used during boot before the real driver becomes
- 	/// available. 
+    /// 标记控制台驱动程序为早期控制台驱动程序，
+    /// 在真正的驱动程序可用之前用于引导期间。
     pub const CON_BOOT: u32 = bindings::cons_flags_CON_BOOT;
 
-    /// A misnomed historical flag which tells the core code
-    /// that the legacy ['console::write'] callback can be invoked
-    /// on a CPU which is marked OFFLINE.
+    /// 一个错误命名的历史标志，告诉核心代码
+    /// 可以在标记为离线的CPU上调用旧的['console::write']回调。
     pub const CON_ANYTIME: u32 = bindings::cons_flags_CON_ANYTIME;
 
-    /// FIndicates a braille device which is exempt from 
-    /// receiving the printk spam for obvious reasons.
+    /// 表示盲文设备，显然这些设备不会接收printk垃圾信息。
     pub const CON_BRL: u32 = bindings::cons_flags_CON_BRL;
 
-    /// The console supports the extended output format of /dev/kmesg 
-    /// which requires a larger output buffer.
+    /// 控制台支持/dev/kmesg的扩展输出格式，
+    /// 这需要更大的输出缓冲区。
     pub const CON_EXTENDED: u32 = bindings::cons_flags_CON_EXTENDED;
 
-    /// Indicates if a console is suspended. If true, 
-    /// the printing callbacks must not be called.
+    /// 表示控制台是否暂停。如果为真，
+    /// 则不应调用打印回调。
     pub const CON_SUSPENDED: u32 = bindings::cons_flags_CON_SUSPENDED;
 }
 
-/// Console's operations
+/// 控制台的操作
 #[vtable]
 pub trait ConsoleOps {
-    /// User data that will be accessible to all operations
+    /// 用户数据，将在所有操作中访问
     type Data: ForeignOwnable + Send + Sync = ();
 
-    /// Write callback to output messages (Optional)
+    /// 输出消息的写回调（可选）
     fn console_write(_co: &Console, _s: *const i8, _count: u32);
 
-    /// Read callback for console input (Optional)
+    /// 控制台输入的读取回调（可选）
     fn console_read(_co: &Console, _s: *mut i8, _count: u32) -> Result<i32>;
 
-    /// Callback for matching a console (Optional)
+    /// 匹配控制台的回调（可选）
     fn console_match(
-        _co: &Console, 
-        _name: *mut i8 , 
-        _idx: i32, 
+        _co: &Console,
+        _name: *mut i8,
+        _idx: i32,
         _options: *mut i8,
     ) -> Result<i32>;
 
-    /// The underlying TTY device driver (Optional)
+    /// 底层TTY设备驱动程序（可选）
     fn console_device(_co: &Console, _index: *mut i8) -> *mut bindings::tty_driver;
 }
 
-/// [`UartDriver`]'s console
+/// [`UartDriver`]的控制台
 ///
-/// # Invariants
+/// # 不变条件
 ///
-/// `self.0` has always valid data.
+/// `self.0`始终包含有效数据。
 pub struct Console(bindings::console);
-impl Console { 
-    /// Create a new [`UartDriver`] Console
-    pub const fn new<T: ConsoleOps>(name:[i8; 16usize], reg: *mut bindings::uart_driver ) -> Self{
-        // SAFETY: `console` is a C structure holding data that has been initialized with 0s,
-        // hence it is safe to use as-is.
+impl Console {
+    /// 创建一个新的[`UartDriver`]控制台
+    pub const fn new<T: ConsoleOps>(name:[i8; 16usize], reg: *mut bindings::uart_driver) -> Self {
+        // SAFETY: `console`是一个C结构，持有已用0初始化的数据，
+        // 因此可以安全地使用。
         let mut console = unsafe { MaybeUninit::<bindings::console>::zeroed().assume_init() };
         console.name   = name;
         console.write  = Some(console_write_callback::<T>);
@@ -108,16 +102,16 @@ impl Console {
         Self(console)
     }
 
-    /// Setup the console other config
+    /// 设置控制台的其他配置
     pub const fn with_config(
-        mut self, 
-        flags: i16, 
-        index:i16, 
-        cflag:i32, 
-        ispeed:u32, 
-        ospeed:u32, 
-        seq: u64, 
-        dropped:u64
+        mut self,
+        flags: i16,
+        index: i16,
+        cflag: i32,
+        ispeed: u32,
+        ospeed: u32,
+        seq: u64,
+        dropped: u64
     ) -> Self {
         self.0.flags = flags;
         self.0.index = index;
@@ -129,18 +123,17 @@ impl Console {
         self
     }
 
-    /// Creates a reference to a [`Console`] from a valid pointer.
+    /// 从有效指针创建对[`Console`]的引用。
     ///
-    /// # Safety
+    /// # 安全
     ///
-    /// Callers must ensure that `ptr` is valid, non-null, and has a non-zero reference count for
-    /// the entire duration when the returned reference exists.
+    /// 调用者必须确保`ptr`有效，非空，并且在返回引用存在期间引用计数不为零。
     pub unsafe fn from_raw<'a>(ptr: *mut bindings::console) -> &'a Self {
-        // SAFETY: Guaranteed by the safety requirements of the function.
+        // SAFETY: 由函数的安全要求保证。
         unsafe { &*ptr.cast() }
     }
 
-    /// Returns a raw pointer to the inner C struct.
+    /// 返回内部C结构的原始指针。
     #[inline]
     pub const fn as_ptr(&self) -> *mut bindings::console {
         &self.0 as *const _ as _
@@ -154,8 +147,8 @@ unsafe extern "C" fn console_write_callback<T: ConsoleOps> (
     co: *mut bindings::console,
     s: *const core::ffi::c_char,
     count: core::ffi::c_uint,
-){
-    let co = unsafe { Console::from_raw(co)};
+) {
+    let co = unsafe { Console::from_raw(co) };
     T::console_write(co, s, count);
 }
 
@@ -163,10 +156,10 @@ unsafe extern "C" fn console_read_callback<T: ConsoleOps> (
     co: *mut bindings::console,
     s: *mut core::ffi::c_char,
     count: core::ffi::c_uint,
-) -> core::ffi::c_int{
-    from_result(||{
-        // SAFETY: The value stored as chip data was returned by `into_foreign` during registration.
-        let co = unsafe { Console::from_raw(co)};
+) -> core::ffi::c_int {
+    from_result(|| {
+        // SAFETY: 存储为芯片数据的值在注册期间由`into_foreign`返回。
+        let co = unsafe { Console::from_raw(co) };
         T::console_read(co, s, count)
     })
 }
@@ -176,9 +169,9 @@ unsafe extern "C" fn console_match_callback<T: ConsoleOps> (
     name: *mut core::ffi::c_char,
     idx: core::ffi::c_int,
     options: *mut core::ffi::c_char,
-) -> core::ffi::c_int{
-    from_result(||{
-        let co = unsafe { Console::from_raw(co)};
+) -> core::ffi::c_int {
+    from_result(|| {
+        let co = unsafe { Console::from_raw(co) };
         T::console_match(co, name, idx, options)
     })
 }
@@ -187,7 +180,7 @@ unsafe extern "C" fn console_device_callback<T: ConsoleOps> (
     co: *mut bindings::console,
     index: *mut core::ffi::c_int,
 ) -> *mut bindings::tty_driver {
-    let co = unsafe { Console::from_raw(co)};
+    let co = unsafe { Console::from_raw(co) };
     T::console_device(co, index as *mut i8)
 }
 

@@ -16,6 +16,7 @@ use core::mem::ManuallyDrop;
 /// # Invariants
 ///
 /// The pointer is valid.
+
 pub struct Clk(Opaque<bindings::clk>);
 
 impl Clk {
