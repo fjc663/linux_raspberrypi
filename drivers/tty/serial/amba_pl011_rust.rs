@@ -1736,8 +1736,7 @@ impl amba::Driver for PL011Device {
             base: reg_mem,
             parent_irq: irq,
         };
-
-        // 未知!!!!!  所有权问题，可能要改
+        
         let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
         unsafe { PORTS[portnr as usize] = Some(uap) };
 
