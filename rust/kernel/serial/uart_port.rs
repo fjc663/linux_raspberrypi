@@ -294,26 +294,10 @@ impl<T: UartPortOps> PortRegistration<T> {
     ///
     /// It is allowed to move.
     pub fn new(
-        membase: *mut u8,
-        mapbase: bindings::resource_size_t,
-        irq: u32,
-        iotype: u8,
-        flags: u64,
-        has_sysrq: u8,
-        fifosize: u32,
-        index: u32,
+       uap: UartPort
     ) -> Self {
         Self {
-            uart_port: UartPort::new().setup(
-                membase,
-                mapbase,
-                irq,
-                iotype,
-                flags,
-                has_sysrq,
-                fifosize,
-                index,
-            ),
+            uart_port: uap,
             dev: None,
             is_registered: false,
             _p: PhantomData,

@@ -10,6 +10,7 @@ use kernel::{
     amba,  // AMBA（高级微控制器总线架构）模块
     clk::Clk,  // 时钟模块
     device,  // 设备模块
+    driver,
     new_device_data,
     error::{code::*, Result},  // 错误处理模块，包括错误代码和结果类型
     module_amba_driver,  // AMBA驱动模块
@@ -19,6 +20,7 @@ use kernel::{
     io_mem::IoMem,  // IO内存模块
     types::ForeignOwnable,
     delay::coarse_sleep,
+    sync::UniqueArc,
     serial::{  // 串口模块
                uart_console::{Console, ConsoleOps, flags},  // 串口控制台相关模块，包括控制台、控制台操作和标志
                uart_driver::UartDriver,  // 串口驱动模块
@@ -31,7 +33,7 @@ use core::{
     fmt::Write,
     pin::{pin, Pin},
     ptr,
-    ffi::c_void,
+    ffi::{c_void, c_uint},
 };
 use alloc::boxed::Box;
 
@@ -69,6 +71,8 @@ const WAKEUP_CHARS: i32 = 256;
 const SER_RS485_RTS_AFTER_SEND: u32 = 1 << 2;
 const UART_DUMMY_DR_RX: u32 = 1 << 16;
 const UPF_HARDPPS_CD: bindings::upf_t = bindings::ASYNC_HARDPPS_CD as bindings::upf_t;
+const PORT_AMBA: c_uint = 32;
+const UART_CONFIG_TYPE: i32 = 1 << 0;
 
 // 设备名称
 const DEV_NAME: &CStr = c_str!("ttyAMA");
@@ -113,20 +117,25 @@ struct Pl011Console;
 impl ConsoleOps for Pl011Console {
     type Data = ();
 
-    fn console_write(_co: &Console, _s: *const i8, _count: u32) {
-        // unsafe {
-        //     // 获取 UART 端口
-        //     let uap = &PORTS[co.index];
-        //     let mut locked = true;
-        //     let mut old_cr = 0;
-        //     let mut new_cr;
-        //
-        //     // 启用时钟
-        //     if let Some(uap) = uap {
-        //
-        //     }
-        //
-        // }
+    fn console_write(co: &Console, _s: *const i8, _count: u32) {
+        let mut co_ptr = unsafe {&mut *co.as_ptr()};
+        // 获取 UART 端口
+        let uap = unsafe { &PORTS[co_ptr.index as usize] }.unwrap();
+        let mut uap_ptr = unsafe { &mut *uap.as_ptr() };
+
+        // let mut locked = true;
+        // let mut old_cr = 0;
+        // let mut new_cr;
+        // let flags: usize;
+
+        let dev = unsafe { device::Device::new(uap_ptr.dev) };
+        // 启用时钟
+        let _ = dev.clk_get().unwrap().prepare_enable();
+
+        // local_irq_save(flags);
+
+
+
 
         pr_info!("console_write ok");
     }
@@ -189,10 +198,11 @@ struct PL011Resources {
     parent_irq: u32,
 }
 
-// PL011注册类型
-type PL011Registrations = PortRegistration<PL011Device>;
-// PL011设备数据类型
-type PL011DeviceData = device::Data<PL011Registrations, PL011Resources, PL011Data>;
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn cpu_relax() {
+    unsafe { core::arch::asm!("yield") }
+}
 
 struct Pl011Handler {}
 
@@ -777,13 +787,13 @@ impl AmbaPl011Pops {
             port_ptr.ignore_status_mask |= UART011_DR_FE | UART011_DR_PE;
         }
 
-        if unsafe { (*new).c_iflag & bindings::IGNBRK != 0} {
+        if unsafe { (*new).c_iflag & bindings::IGNBRK != 0 } {
             port_ptr.ignore_status_mask |= UART011_DR_BE;
             /*
              * If we're ignoring parity and break indicators,
              * ignore overruns too (for real raw support).
              */
-            if unsafe { (*new).c_iflag & bindings::IGNPAR != 0} {
+            if unsafe { (*new).c_iflag & bindings::IGNPAR != 0 } {
                 port_ptr.ignore_status_mask |= UART011_DR_OE;
             }
         }
@@ -810,21 +820,35 @@ impl AmbaPl011Pops {
         Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
     }
 
-    fn pl011_write_lcr_h(port: &UartPort, lcr_h: u32){
+    fn pl011_write_lcr_h(port: &UartPort, lcr_h: u32) {
         Self::pl011_write(lcr_h, port, Register::RegLcrhRx as usize);
-        if Self::pl011_split_lcrh(port){
+        if Self::pl011_split_lcrh(port) {
             /*
              * Wait 10 PCLKs before writing LCRH_TX register,
              * to get this delay write read only register 10 times
              */
 
-            for i in 0..10{
+            for i in 0..10 {
                 Self::pl011_write(0xff, port, Register::RegMis as usize);
             }
             Self::pl011_write(lcr_h, port, Register::RegLcrhTx as usize);
         }
     }
 
+    #[cfg(CONFIG_CONSOLE_POLL)]
+    fn pl011_quiesce_irqs(port: &UartPort) {
+        Self::pl011_write(Self::pl011_read(port, Register::RegMis as usize), port, Register::RegIcr as usize);
+        /*
+         * 无法清除 TXIM，因为这是“准备传输中断”，所以我们只需屏蔽它。start_tx() 将会取消屏蔽它。
+         *
+         * 请注意，我们可能会与 start_tx() 发生竞争，如果竞争发生，轮询用户可能会在我们清除中断后立即收到另一个中断。
+         * 但这应该是可以的，因为即使没有竞争，也可能发生这种情况，例如控制器立即获得一些新数据并触发了中断。
+         *
+         * 任何使用轮询例程的人都假设它管理设备（包括传输队列），因此我们也可以处理 start_tx() 调用方的情况。
+         */
+
+        Self::pl011_write(Self::pl011_read(port, Register::RegImsc as usize) & !UART011_TXIM, port, Register::RegImsc as usize);
+    }
 }
 
 #[vtable]
@@ -962,19 +986,13 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @send_xchar:  send a break character
-    fn send_xchar(_port: &UartPort, ch: i8) {
-        todo!();
-    }
+    fn send_xchar(_port: &UartPort, ch: i8) {}
 
     /// * @stop_rx:      stop receiving
-    fn stop_rx(_port: &UartPort) {
-        todo!();
-    }
+    fn stop_rx(_port: &UartPort) {}
 
     /// * @start_rx:    start receiving
-    fn start_rx(_port: &UartPort) {
-        todo!();
-    }
+    fn start_rx(_port: &UartPort) {}
 
     /// * @enable_ms:    enable modem status interrupts
     fn enable_ms(port: &UartPort) {
@@ -1210,20 +1228,20 @@ impl UartPortOps for AmbaPl011Pops {
         Self::pl011_setup_status_masks(port, new);
 
         // 如果启用调制解调器状态信号
-        if unsafe {port_ptr.flags & UPF_HARDPPS_CD != 0 || (*new).c_cflag & bindings::CRTSCTS != 0 || !((*new).c_cflag & bindings::CLOCAL) != 0}{
+        if unsafe { port_ptr.flags & UPF_HARDPPS_CD != 0 || (*new).c_cflag & bindings::CRTSCTS != 0 || !((*new).c_cflag & bindings::CLOCAL) != 0 } {
             Self::pl011_enable_ms(port);
         }
 
         // 如果启用 RS485，禁用 CRTSCTS
-        if port_ptr.rs485.flags & SER_RS485_ENABLED !=0 {
-            unsafe {(*new).c_cflag  &= !bindings::CRTSCTS}
+        if port_ptr.rs485.flags & SER_RS485_ENABLED != 0 {
+            unsafe { (*new).c_cflag &= !bindings::CRTSCTS }
         }
 
         // 读取当前控制寄存器的值
         let mut old_cr = Self::pl011_read(port, Register::RegCr as usize);
 
         // 根据 c_cflag 设置硬件流控制
-        if unsafe { (*new).c_cflag & bindings::CRTSCTS != 0} {
+        if unsafe { (*new).c_cflag & bindings::CRTSCTS != 0 } {
             if old_cr & UART011_CR_RTS != 0 {
                 old_cr |= UART011_CR_RTSEN;
             }
@@ -1237,7 +1255,7 @@ impl UartPortOps for AmbaPl011Pops {
 
         // 如果vendor支持过采样，调整控制寄存器的过采样位
         if pl011_data.vendor.oversampling {
-            if baud > port_ptr.uartclk / 16{
+            if baud > port_ptr.uartclk / 16 {
                 old_cr |= ST_UART011_CR_OVSFACT;
             } else {
                 old_cr &= !ST_UART011_CR_OVSFACT;
@@ -1248,9 +1266,9 @@ impl UartPortOps for AmbaPl011Pops {
          * 对于 ST Micro 过采样变体，通过降低分频器略微增加比特率，以避免高速度下采样延迟导致的数据损坏。
          */
         if pl011_data.vendor.oversampling {
-            if (baud >= 3000000) && (baud < 3250000) && (quot > 1){
+            if (baud >= 3000000) && (baud < 3250000) && (quot > 1) {
                 quot -= 1;
-            } else if (baud > 3250000) && (quot > 2){
+            } else if (baud > 3250000) && (quot > 2) {
                 quot -= 2;
             }
         }
@@ -1275,24 +1293,29 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @set_ldisc:    set the line discipline
-    fn set_ldisc(_port: &UartPort, _arg2: *mut bindings::ktermios) {
-        todo!();
-    }
+    fn set_ldisc(_port: &UartPort, _arg2: *mut bindings::ktermios) {}
 
     /// * @pm:            power management
-    fn pm(_port: &UartPort, _state: u32, _oldstate: u32) {
-        todo!();
-    }
+    fn pm(_port: &UartPort, _state: u32, _oldstate: u32) {}
 
     /// * @type:          get the type of the UART
-    fn port_type(_port: &UartPort) -> *const i8 {
-        todo!();
+    fn port_type(port: &UartPort) -> *const i8 {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        if port_ptr.type_ == PORT_AMBA {
+            // 将 type_ 字段转换为 C 字符串指针
+            let c_str = CStr::from_bytes_with_nul(&pl011_data.type_).unwrap();
+            c_str.as_ptr() as *const i8
+        } else {
+            ptr::null()
+        }
     }
 
     /// * @release_port: release the UART port
-    fn release_port(uart_port: &UartPort) {
-        todo!();
-    }
+    fn release_port(uart_port: &UartPort) {}
 
     /// * @request_port: request the UART port
     fn request_port(uart_port: &UartPort) -> i32 {
@@ -1301,12 +1324,30 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @config_port:  configure the UART port
     fn config_port(uart_port: &UartPort, flags: i32) {
-        todo!();
+        if flags & UART_CONFIG_TYPE != 0 {
+            let mut port_ptr = unsafe { &mut *uart_port.as_ptr() };
+            port_ptr.type_ = PORT_AMBA;
+        }
     }
 
     /// * @verify_port:  verify the UART port
     fn verify_port(uart_port: &UartPort, ser: *mut bindings::serial_struct) -> i32 {
-        todo!();
+        let port_ptr = unsafe { &*uart_port.as_ptr() };
+        let mut ret: i32 = 0;
+        if unsafe { (*ser).type_ != bindings::PORT_UNKNOWN as i32 && (*ser).type_ != bindings::PORT_AMBA as i32 } {
+            ret = -(bindings::EINVAL as i32);
+        }
+        if unsafe { (*ser).irq < 0 || (*ser).irq >= bindings::NR_IRQS as i32 } {
+            ret = -(bindings::EINVAL as i32);
+        }
+        if unsafe { (*ser).baud_base < 9600 } {
+            ret = -(bindings::EINVAL as i32);
+        }
+        if unsafe { port_ptr.mapbase != (*(*ser).iomem_base) as u64 } {
+            ret = -(bindings::EINVAL as i32);
+        }
+
+        ret
     }
 
     /// * @ioctl:        ioctl handler
@@ -1314,17 +1355,60 @@ impl UartPortOps for AmbaPl011Pops {
         todo!();
     }
 
-    /// #[cfg(CONFIG_CONSOLE_POLL)]
+    #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_init(uart_port: &UartPort) -> i32 {
-        todo!();
+        let port_ptr = unsafe { &*uart_port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        // 初始化硬件
+        if let Err(_) = Self::pl011_hwinit(uart_port, pl011_data.as_mut()) {
+            return 1;
+        }
+        0
     }
-    /// #[cfg(CONFIG_CONSOLE_POLL)]
+
+    #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_put_char(uart_port: &UartPort, arg2: u8) {
-        todo!();
+        // 等待传输队列不满
+        while Self::pl011_read(uart_port, Register::RegFr as usize) & UART01X_FR_TXFF != 0 {
+            // 放松 CPU，以防止忙等待导致 CPU 过度消耗
+            cpu_relax();  // 未知!!!!!  不确定
+        }
+
+        // 将字符写入传输数据寄存器
+        Self::pl011_write(arg2 as u32, uart_port, Register::RegDr as usize);
     }
-    /// #[cfg(CONFIG_CONSOLE_POLL)]
+
+    #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_get_char(uart_port: &UartPort) -> i32 {
-        todo!();
+        /*
+         * The caller might need IRQs lowered, e.g. if used with KDB NMI
+         * debugger.
+         */
+        Self::pl011_quiesce_irqs(uart_port);
+
+        let status = Self::pl011_read(uart_port, Register::RegFr as usize);
+        if status & UART01X_FR_RXFE != 0 {
+            return bindings::NO_POLL_CHAR as i32;
+        }
+
+        Self::pl011_read(uart_port, Register::RegDr as usize) as i32
+    }
+}
+
+// PL011注册类型
+type PL011Registrations = PortRegistration<AmbaPl011Pops>;
+// PL011设备数据类型
+type PL011DeviceData = device::Data<PL011Registrations, PL011Resources, PL011Data>;
+
+struct AmbaDeviceData {
+    inner: Pin<UniqueArc<PL011DeviceData>>,
+}
+
+impl driver::DeviceRemoval for AmbaDeviceData {
+    fn device_remove(&self) {
+        dbg!("********* 释放资源 *********\n");
     }
 }
 
@@ -1339,6 +1423,9 @@ kernel::module_amba_id_table!(UART_MOD_TABLE, MY_AMDA_ID_TABLE);
 struct PL011Device;
 // 实现AMBA驱动程序接口
 impl amba::Driver for PL011Device {
+    // type Data = Box<AmbaDeviceData>;
+    type Data = ();
+
     // AMBA ID表
     kernel::driver_amba_id_table!(MY_AMDA_ID_TABLE);
     // 探测函数
@@ -1379,12 +1466,21 @@ impl amba::Driver for PL011Device {
         // 设置标志
         let flags = UPF_BOOT_AUTOCONF;
         // 创建并设置串口端口
-        // let mut uap = UartPort::new();
+        let mut uap = UartPort::new();
 
-        // // uap.vendor = &VENDOR_DATA;
-        // uap.fifosize = fifosize;
-        //
+        uap.setup(
+            membase,
+            mapbase,
+            irq,
+            iotype,
+            flags,
+            has_sysrq,
+            fifosize,
+            portnr as _,
+        );
 
+
+        // 未知!!!!! 麻烦、复杂
         let mut type_: [u8; 12] = [0; 12];
         // 设置端口类型
         let rev = adev.revision_get().unwrap();
@@ -1415,21 +1511,13 @@ impl amba::Driver for PL011Device {
             parent_irq: irq,
         };
 
-        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(
-            membase,
-            mapbase,
-            irq,
-            iotype,
-            flags,
-            has_sysrq,
-            fifosize,
-            portnr as _,
-        );
+        // 未知!!!!!  所有权问题，可能要改
+        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
+        unsafe { PORTS[portnr as usize] = Some(uap) };
+
+        // let pl011_device_data = new_device_data!(pl011_registrations, pl011_resources, pl011_data, "ttyAMA")?;  // 未知!!!!!  可能有问题
 
         let pl011_registrations_pin = pin!(pl011_registrations);
-
-        // let pl011_device_data = new_device_data!(&pl011_registrations_pin, &pl011_resources, &pl011_data, "ttyAMA")?;
-
         pl011_registrations_pin.register(
             adev,
             &UART_DRIVER,
@@ -1438,9 +1526,15 @@ impl amba::Driver for PL011Device {
         )?;
 
         dbg!("********* PL061 GPIO芯片已注册 *********\n");
+        // Ok(Box::try_new(
+        //     AmbaDeviceData {
+        //         inner: pl011_device_data,
+        // })?)
+
         Ok(())
     }
 }
+
 
 // 注册AMBA驱动程序
 module_amba_driver! {
