@@ -10,6 +10,7 @@ use kernel::{
     amba,  // AMBA（高级微控制器总线架构）模块
     clk::Clk,  // 时钟模块
     device,  // 设备模块
+    device::RawDevice,
     driver,
     new_device_data,
     error::{code::*, Result},  // 错误处理模块，包括错误代码和结果类型
@@ -33,7 +34,7 @@ use core::{
     fmt::Write,
     pin::{pin, Pin},
     ptr,
-    ffi::{c_void, c_uint},
+    ffi::{c_void, c_uint, c_uchar},
 };
 use alloc::boxed::Box;
 
@@ -73,11 +74,18 @@ const UART_DUMMY_DR_RX: u32 = 1 << 16;
 const UPF_HARDPPS_CD: bindings::upf_t = bindings::ASYNC_HARDPPS_CD as bindings::upf_t;
 const PORT_AMBA: c_uint = 32;
 const UART_CONFIG_TYPE: i32 = 1 << 0;
+const CONFIG_OF: i32 = 1;
 
 // 设备名称
 const DEV_NAME: &CStr = c_str!("ttyAMA");
 // 驱动程序名称
 const DRIVER_NAME: &CStr = c_str!("ttyAMA");
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn cpu_relax() {
+    unsafe { core::arch::asm!("yield") }
+} // 未知!!!!!
 
 static PL011_STD_OFFSETS: [u32; REG_ARRAY_SIZE] = initialize_offsets();
 
@@ -112,31 +120,188 @@ pub(crate) static UART_DRIVER: UartDriver = UartDriver::new(
 
 // pl011控制台的结构体
 struct Pl011Console;
+
+impl Pl011Console {
+    // 向 UART 发送一个字符
+    extern "C" fn pl011_console_putchar(port_ptr: *mut bindings::uart_port, ch: c_uchar) {
+        let uap = unsafe { &UartPort::from_raw(port_ptr) };
+        while AmbaPl011Pops::pl011_read(uap, Register::RegFr as usize) & UART01X_FR_TXFF != 0 {
+            cpu_relax(); // CPU 进入低功耗状态  // 未知!!!!!  不确定
+        }
+        AmbaPl011Pops::pl011_write(ch as u32, uap, Register::RegDr as usize); // 将字符写入数据寄存器
+    }
+
+    fn pl011_console_get_options(uap: &UartPort, baud: &mut i32, parity: &mut i32, bits: &mut i32) {
+        if AmbaPl011Pops::pl011_read(uap, Register::RegCr as usize) & UART01X_CR_UARTEN != 0 {  // 检查 UART 是否启用
+            let lcr_h = AmbaPl011Pops::pl011_read(uap, Register::RegLcrhTx as usize); // 读取行控制寄存器
+
+            *parity = 'n' as i32;
+            if lcr_h & UART01X_LCRH_PEN != 0 { // 检查是否启用奇偶校验
+                if lcr_h & UART01X_LCRH_EPS != 0 {
+                    *parity = 'e' as i32; // 启用偶校验
+                } else {
+                    *parity = 'o' as i32; // 启用奇校验
+                }
+
+                if (lcr_h & 0x60) == UART01X_LCRH_WLEN_7 {
+                    *bits = 7; // 数据位为7
+                } else {
+                    *bits = 8; // 数据位为8
+                }
+
+                let ibrd = AmbaPl011Pops::pl011_read(uap, Register::RegIbrd as usize); // 读取整数波特率除数
+                let fbrd = AmbaPl011Pops::pl011_read(uap, Register::RegFbrd as usize); // 读取小数波特率除数
+
+                let uap_ptr = unsafe { &*uap.as_ptr() };
+                let mut pl011_data: Box<PL011Data> = unsafe {
+                    <Box<PL011Data> as ForeignOwnable>::from_foreign(uap_ptr.private_data)
+                };
+                *baud = (uap_ptr.uartclk * 4 / (64 * ibrd + fbrd)) as i32; // 计算波特率
+
+                if pl011_data.vendor.oversampling { // 如果启用过采样
+                    if AmbaPl011Pops::pl011_read(uap, Register::RegCr as usize) & ST_UART011_CR_OVSFACT != 0 {
+                        *baud *= 2; // 波特率翻倍
+                    }
+                }
+            }
+        }
+    }
+
+    fn pl011_console_setup(co: &Console, options: *mut i8) -> Result<i32> {
+        let mut baud: i32 = 38400;  // 默认波特率
+        let mut bits: i32 = 8; // 默认数据位
+        let mut parity: i32 = 'n' as i32; // 默认无奇偶校验
+        let mut flow: i32 = 'n' as i32; // 默认无流控
+
+        let mut co_ptr = unsafe { &mut *co.as_ptr() };
+
+        /*
+         * 检查是否指定了无效的 UART 号，
+         * 如果是，则搜索第一个可用的具有控制台支持的端口。
+         */
+        if co_ptr.index >= UART_NR as i16 {
+            co_ptr.index = 0;
+        }
+
+        if unsafe { &PORTS[co_ptr.index as usize] }.is_none() {
+            return Err(ENODEV);  // 如果端口不存在，返回 -ENODEV
+        }
+        let uap = &unsafe { &PORTS[co_ptr.index as usize] }.unwrap(); // 获取指定索引的端口
+        let mut uap_ptr = unsafe { &mut *uap.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(uap_ptr.private_data)
+        };
+
+        /* 允许引脚复用并配置 */
+        // pinctrl_pm_select_default_state(uap->port.dev);  未知!!!!!  ../linux_raspberrypi/include/linux/pinctrl/consumer.h
+
+        let dev = unsafe { device::Device::new(uap_ptr.dev) };
+        let clk = dev.clk_get().unwrap();
+        clk.prepare_enable()?;  //准备时钟
+
+        // 未知!!!!! 怎么实现
+        // if (dev_get_platdata(uap->port.dev)) {
+        //     struct amba_pl011_data *plat;
+        //
+        //     plat = dev_get_platdata(uap->port.dev);
+        //     if (plat->init)
+        //     plat->init(); // 调用平台数据中的初始化函数
+        // }
+
+        uap_ptr.uartclk = clk.get_rate() as u32; // 获取 UART 时钟频率
+
+        if pl011_data.vendor.fixed_options {
+            baud = pl011_data.fixed_baud as i32; // 如果固定波特率选项启用，使用固定波特率
+        } else {
+            if !options.is_null() {
+                unsafe {
+                    bindings::uart_parse_options(options,
+                                                 &mut baud as *mut _,
+                                                 &mut parity as *mut _,
+                                                 &mut bits as *mut _,
+                                                 &mut flow as *mut _); // 解析命令行选项
+                }
+            } else {
+                Self::pl011_console_get_options(uap, &mut baud, &mut parity, &mut bits); // 获取控制台选项
+            }
+        }
+
+        let mut co_ptr = unsafe { &mut *co.as_ptr() };
+        let ret = unsafe { bindings::uart_set_options(uap_ptr, co_ptr, baud, parity, bits, flow) }; // 设置 UART 选项
+
+        if ret == 0 {
+            Ok(0)
+        } else {
+            Err(ENODEV)
+        }
+    }
+}
+
 // 实现`Pl011Console`的操作
 #[vtable]
 impl ConsoleOps for Pl011Console {
     type Data = ();
 
-    fn console_write(co: &Console, _s: *const i8, _count: u32) {
-        let mut co_ptr = unsafe {&mut *co.as_ptr()};
+    fn console_write(co: &Console, s: *const i8, count: u32) {
+        let mut co_ptr = unsafe { &mut *co.as_ptr() };
         // 获取 UART 端口
-        let uap = unsafe { &PORTS[co_ptr.index as usize] }.unwrap();
+        let uap = &unsafe { &PORTS[co_ptr.index as usize] }.unwrap();
         let mut uap_ptr = unsafe { &mut *uap.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(uap_ptr.private_data)
+        };
 
-        // let mut locked = true;
-        // let mut old_cr = 0;
-        // let mut new_cr;
+        let mut locked: i32 = 1;
+        let mut old_cr = 0;
+        let mut new_cr;
         // let flags: usize;
 
         let dev = unsafe { device::Device::new(uap_ptr.dev) };
         // 启用时钟
         let _ = dev.clk_get().unwrap().prepare_enable();
 
-        // local_irq_save(flags);
+        // 保存中断状态
+        // local_irq_save(flags);  // 未知!!!!!   ../linux_raspberrypi/include/linux/irqflags.h  +220
 
+        let union_ptr = &uap_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
 
+        if uap_ptr.sysrq != 0 {
+            locked = 0;
+        } else if unsafe { bindings::oops_in_progress != 0 } {
+            // 如果有故障发生，尝试加锁
+            locked = unsafe { bindings::_raw_spin_trylock(&(*union_ptr).rlock as *const _ as *mut _) };
+        } else {
+            unsafe { bindings::_raw_spin_lock(&(*union_ptr).rlock as *const _ as *mut _) };
+        }
 
+        /*
+         * 先保存控制寄存器的值，然后禁用中断
+         */
+        if !pl011_data.vendor.always_enabled { // 如果设备不总是启用
+            old_cr = AmbaPl011Pops::pl011_read(uap, Register::RegCr as usize); // 读取当前控制寄存器的值
+            new_cr = old_cr & !UART011_CR_CTSEN; // 禁用 CTS
+            new_cr |= UART01X_CR_UARTEN | UART011_CR_TXE; // 启用 UART 和发送
+            AmbaPl011Pops::pl011_write(new_cr, uap, Register::RegCr as usize); // 写入新的控制寄存器值
+        }
 
+        unsafe { bindings::uart_console_write(uap.as_ptr(), s, count, Some(Self::pl011_console_putchar)) }; // 调用通用控制台写入函数
+
+        /*
+         * 最后，等待发送器变为空，然后恢复控制寄存器的值。
+         * 允许特征寄存器位被反转以解决错误。
+         */
+        while (AmbaPl011Pops::pl011_read(uap, Register::RegFr as usize) ^ pl011_data.vendor.inv_fr) & pl011_data.vendor.fr_busy != 0 {
+            cpu_relax(); // 等待发送完成  // 未知!!!!!  不确定
+        }
+
+        if !pl011_data.vendor.always_enabled {
+            AmbaPl011Pops::pl011_write(old_cr, uap, Register::RegCr as usize); // 恢复控制寄存器的值
+        }
+
+        // 恢复中断状态
+        // local_irq_restore(flags); // 未知!!!!!   ../linux_raspberrypi/include/linux/irqflags.h  +227
+
+        // clk_disable(uap->clk); // 禁用时钟  // 未知!!!!! 好像drop自动实现
         pr_info!("console_write ok");
     }
 
@@ -146,13 +311,63 @@ impl ConsoleOps for Pl011Console {
     }
 
     fn console_match(
-        _co: &Console,
-        _name: *mut i8,
-        _idx: i32,
-        _options: *mut i8,
-    ) -> Result<i32> {
+        co: &Console,
+        name: *mut i8,
+        idx: i32,
+        options: *mut i8,
+    ) -> Result<i32>
+    {
+        let mut iotype: c_uchar = 0;
+        let mut addr: bindings::resource_size_t = 0;
+
+        /*
+         * 受 Qualcomm Technologies QDF2400 E44 勘误影响的系统有一个不同的控制台名称，
+         * 所以需要检查该名称。实际的勘误实现发生在探测函数中。
+         */
+
+        let name_cstr = unsafe { CStr::from_char_ptr(name) };
+        let name_str = name_cstr.to_str()?;
+        if name_str != "qdf2400_e44" && name_str != "pl011" {  //未知!!!!!  不确定
+            return Err(ENODEV);  // 如果名称不匹配，返回 -ENODEV
+        }
+
+        // 如果解析早期控制台参数失败，返回 -ENODEV
+        if unsafe {
+            bindings::uart_parse_earlycon(
+                options,
+                &mut iotype as *mut _,
+                &mut addr as *mut _,
+                options as *mut *mut _,
+            ) != 0
+        } {
+            return Err(ENODEV); // 如果解析早期控制台参数失败，返回 -ENODEV
+        }
+
+        if u32::from(iotype) != UPIO_MEM && u32::from(iotype) != UPIO_MEM32 {
+            return Err(ENODEV); // 如果 IO 类型不匹配，返回 -ENODEV
+        }
+
+        /* 尝试匹配命令行中指定的端口 */
+        for i in 0..UART_NR {
+            if unsafe { PORTS[i] }.is_none() {
+                continue; // 如果端口为空，继续下一次循环
+            }
+
+            let port = &unsafe { &PORTS[i] }.unwrap(); // 获取 UART 端口
+            let mut port_ptr = unsafe { &mut *port.as_ptr() };
+
+            if port_ptr.mapbase != addr {
+                continue; // 如果地址不匹配，继续下一次循环
+            }
+
+            let mut co_ptr = unsafe { &mut *co.as_ptr() };
+            co_ptr.index = i as i16; // 设置控制台索引
+            port_ptr.cons = co_ptr; // 将控制台关联到端口
+            return Self::pl011_console_setup(co, options); // 调用控制台设置函数
+        }
+
         pr_info!("console_match ok");
-        Ok(0)
+        Err(ENODEV)  // 如果没有匹配成功，返回 -ENODEV
     }
 
     fn console_device(_co: &Console, _index: *mut i8) -> *mut bindings::tty_driver {
@@ -175,7 +390,7 @@ pub(crate) static VENDOR_DATA: VendorData = VendorData {
     dma_threshold: false,
     cts_event_workaround: false,
     always_enabled: false,
-    fixfixed_options: false,
+    fixed_options: false,
 };
 
 // PL011数据的结构体
@@ -198,12 +413,6 @@ struct PL011Resources {
     parent_irq: u32,
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn cpu_relax() {
-    unsafe { core::arch::asm!("yield") }
-}
-
 struct Pl011Handler {}
 
 impl irq::Handler for Pl011Handler {
@@ -214,7 +423,7 @@ impl irq::Handler for Pl011Handler {
         let mut flags: u64 = 0;
         let mut handled = false;
         let mut pass_counter = AMBA_ISR_PASS_LIMIT;
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
 
         flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -335,6 +544,23 @@ impl AmbaPl011Pops {
                 }
             }
         }
+
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+        pl011_data.rs485_tx_started = true;
+    }
+
+    fn pl011_start_tx_pio(port: &UartPort) {
+        let port_ptr = unsafe { &*port.as_ptr() };
+        let mut pl011_data: Box<PL011Data> = unsafe {
+            <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
+        };
+
+        if Self::pl011_tx_chars(port, false) {
+            pl011_data.im |= UART011_TXIM;
+            Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
+        }
     }
 
     fn pl011_stop_rx(port: &UartPort, pl011_data: &mut PL011Data) {
@@ -348,7 +574,7 @@ impl AmbaPl011Pops {
 
     fn pl011_hwinit(port: &UartPort, pl011_data: &mut PL011Data) -> Result {
         // 可选地启用引脚复用并配置
-        /* pinctrl_pm_select_default_state(port->dev); */  // 未知!!!!! 怎么实现？
+        /* pinctrl_pm_select_default_state(port->dev); */  // 未知!!!!! 怎么实现？ ../linux_raspberrypi/include/linux/pinctrl/consumer.h
 
         let mut port_ptr = unsafe { &mut *port.as_ptr() };
         let dev = unsafe { device::Device::new(port_ptr.dev) };
@@ -425,7 +651,7 @@ impl AmbaPl011Pops {
                 }
             }
 
-            let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!! 转化问题疑问
+            let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!! 转化问题疑问
             unsafe { bindings::_raw_spin_unlock(&(*union_ptr).rlock as *const _ as *mut _); }
 
             let sysrq = port.uart_handle_sysrq_char(ch as u8 & 255);
@@ -473,7 +699,7 @@ impl AmbaPl011Pops {
         Self::pl011_fifo_to_tty(port);
 
         let mut port_ptr = unsafe { &mut *port.as_ptr() };
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         unsafe { bindings::_raw_spin_unlock(&(*union_ptr).rlock as *const _ as *mut _); }
 
         // unsafe { bindings::tty_flip_buffer_push((*port_ptr.state).port) };  // 未知!!!!!  怎么实现
@@ -654,7 +880,7 @@ impl AmbaPl011Pops {
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
         };
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
         let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -680,7 +906,7 @@ impl AmbaPl011Pops {
     fn pl011_disable_interrupts(port: &UartPort, pl011_data: &mut PL011Data) {
         let port_ptr = unsafe { &*port.as_ptr() };
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 加锁以保护对 CR 寄存器的访问
         unsafe { bindings::_raw_spin_lock(&(*union_ptr).rlock as *const _ as *mut _); }
 
@@ -746,7 +972,7 @@ impl AmbaPl011Pops {
 
         port_ptr.status &= !(UPSTAT_AUTOCTS | UPSTAT_AUTORTS);
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 加锁以保护对 CR 寄存器的访问
         unsafe { bindings::_raw_spin_lock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
 
@@ -935,10 +1161,13 @@ impl UartPortOps for AmbaPl011Pops {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
         };
 
+        // 如果启用了 RS485 模式且传输尚未开始，调用 RS485 传输启动函数
         if ((port_ptr.rs485.flags & SER_RS485_ENABLED) != 0) && !pl011_data.rs485_tx_started {
             Self::pl011_rs485_tx_start(port);
-            pl011_data.rs485_tx_started = true;
         }
+
+        // 启动 PIO 模式下的传输
+        Self::pl011_start_tx_pio(port);
     }
 
     /// * @throttle:     stop receiving
@@ -949,7 +1178,7 @@ impl UartPortOps for AmbaPl011Pops {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
         };
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
         let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -970,7 +1199,7 @@ impl UartPortOps for AmbaPl011Pops {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
         };
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
         let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -1012,7 +1241,7 @@ impl UartPortOps for AmbaPl011Pops {
     /// * @break_ctl:   set the break control
     fn break_ctl(port: &UartPort, ctl: i32) {
         let port_ptr = unsafe { &*port.as_ptr() };
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
         let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -1054,7 +1283,7 @@ impl UartPortOps for AmbaPl011Pops {
         // 配置 FIFO 水平
         Self::pl011_write(pl011_data.vendor.ifls, port, Register::RegIfls as usize);
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 加锁以保护对 CR 寄存器的访问
         unsafe { bindings::_raw_spin_lock_irq(&(*union_ptr).rlock as *const _ as *mut _); }
 
@@ -1204,7 +1433,7 @@ impl UartPortOps for AmbaPl011Pops {
         // 获取帧大小
         let bits = unsafe { bindings::tty_get_frame_size((*new).c_cflag) };
 
-        let union_ptr = unsafe { &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1 };   // 未知!!!!!  转化问题疑问
+        let union_ptr = &port_ptr.lock as *const _ as *const bindings::spinlock__bindgen_ty_1;   // 未知!!!!!  转化问题疑问
         // 保护代码块，禁止中断
         let flags = unsafe { bindings::_raw_spin_lock_irqsave(&(*union_ptr).rlock as *const _ as *mut _) };
 
@@ -1433,14 +1662,10 @@ impl amba::Driver for PL011Device {
         dev_info!(adev,"{} PL061 GPIO chip (probe)\n",adev.name());
         dbg!("********** PL061 GPIO chip (probe) *********\n");
 
-        // let dev = device::Device::from_dev(adev);
-
         // 查找可用的端口号
         let portnr = pl011_find_free_port()?;
         dev_info!(adev,"portnr is {}\n",portnr);
 
-        // 获取时钟
-        // let clk = dev.clk_get().unwrap();
         // 确定FIFO大小
         let fifosize = if adev.revision_get().unwrap() < 3 { 16 } else { 32 };
         // 设置IO类型
@@ -1468,6 +1693,8 @@ impl amba::Driver for PL011Device {
         // 创建并设置串口端口
         let mut uap = UartPort::new();
 
+        let dev = device::Device::from_dev(adev);
+        let index = pl011_probe_dt_alias(portnr as _, dev.clone());
         uap.setup(
             membase,
             mapbase,
@@ -1476,9 +1703,8 @@ impl amba::Driver for PL011Device {
             flags,
             has_sysrq,
             fifosize,
-            portnr as _,
+            index as _,
         );
-
 
         // 未知!!!!! 麻烦、复杂
         let mut type_: [u8; 12] = [0; 12];
@@ -1517,6 +1743,12 @@ impl amba::Driver for PL011Device {
 
         // let pl011_device_data = new_device_data!(pl011_registrations, pl011_resources, pl011_data, "ttyAMA")?;  // 未知!!!!!  可能有问题
 
+        /* 确保该 UART 的中断被屏蔽和清除 */
+        AmbaPl011Pops::pl011_write(0, &uap, Register::RegImsc as usize); // 屏蔽中断
+        AmbaPl011Pops::pl011_write(0xffff, &uap, Register::RegIcr as usize); // 清除中断
+
+        amba_set_drvdata(dev.clone(), &mut uap);
+
         let pl011_registrations_pin = pin!(pl011_registrations);
         pl011_registrations_pin.register(
             adev,
@@ -1553,5 +1785,47 @@ fn pl011_find_free_port() -> Result<usize> {
         }
     }
     Err(EBUSY)
+}
+
+// 查找设备树别名函数
+fn pl011_probe_dt_alias(index: i32, dev: device::Device) -> i32 {
+    let mut seen_dev_with_alias: bool = false; // 标记是否存在别名设备
+    let mut seen_dev_without_alias: bool = false; // 标记是否存在无别名设备
+    let mut ret = index;
+
+    if CONFIG_OF == 0 {
+        return ret;
+    }
+
+    let dev_ptr = dev.raw_device();
+    let np = unsafe { (*dev_ptr).of_node }; // 获取设备节点
+    if np.is_null() {
+        return ret;
+    }
+
+    let alias_name = c_str!("serial");
+    ret = unsafe { bindings::of_alias_get_id(np, alias_name.as_ptr() as *const _) }; // 获取设备树中的别名 ID
+
+    if ret < 0 {
+        seen_dev_without_alias = true; // 标记存在无别名设备
+        ret = index; // 使用传入的索引
+    } else {
+        seen_dev_with_alias = true; // 标记存在别名设备
+        if ret >= UART_NR as _ || unsafe { !PORTS[ret as usize].is_none() } { // 检查别名 ID 是否有效
+            dev_warn!(dev, "requested serial port {}  not available.\n", ret); // 打印警告信息
+            ret = index; // 使用传入的索引
+        }
+    }
+
+    if seen_dev_with_alias && seen_dev_without_alias {  // 如果同时存在别名和无别名设备
+        dev_warn!(dev, "aliased and non-aliased serial devices found in device tree. Serial port enumeration may be unpredictable.\n"); // 打印警告信息
+    }
+
+    ret // 返回索引
+}
+
+fn amba_set_drvdata(dev: device::Device, uap: &mut UartPort){
+    let dev_ptr = dev.raw_device();
+    unsafe { (*dev_ptr).driver_data = uap.as_ptr() as *mut _ };
 }
 

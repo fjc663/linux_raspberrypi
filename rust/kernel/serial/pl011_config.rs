@@ -283,7 +283,7 @@ pub struct VendorData {
     pub always_enabled: bool,
 
     /// Options for fixing fixed functionality
-    pub fixfixed_options: bool,
+    pub fixed_options: bool,
 }
 
 
@@ -301,7 +301,7 @@ pub struct VendorData {
 //             dma_threshold: false,
 //             cts_event_workaround: false,
 //             always_enabled: false,
-//             fixfixed_options: false,
+//             fixed_options: false,
 //         }
 //     }
 // }
