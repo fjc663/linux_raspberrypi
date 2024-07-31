@@ -24,7 +24,6 @@ use core::{
 };
 
 use macros::vtable;
-use alloc::boxed::Box;
 
 const CONFIG_HZ: u64 = 250;
 const HZ: u64 = CONFIG_HZ;
@@ -132,14 +131,9 @@ pub trait UartPortOps {
 #[repr(transparent)]
 pub struct UartPort(bindings::uart_port);
 
-/// 判断类型是否相同的辅助函数
-fn typecheck<T>(_: &T, _: &T) -> bool {
-    true
-}
-
 /// 检查是否 `a` 在 `b` 之后
 fn time_after(a: u64, b: u64) -> bool {
-    typecheck(&a, &0u64) && typecheck(&b, &0u64) && (b as i64 - a as i64) < 0
+    (b as i64 - a as i64) < 0
 }
 
 /// 检查是否 `a` 在 `b` 之前
@@ -157,7 +151,7 @@ fn uart_console(port: &UartPort) -> bool {
 }
 
 #[cfg(not(feature = "serial_core_console"))]
-fn uart_console(port: &UartPort) -> bool {
+fn uart_console(_port: &UartPort) -> bool {
     false
 }
 
@@ -185,6 +179,13 @@ impl UartPort {
         &self.0 as *const _ as *mut _
     }
 
+    /// Checks if UART transmission is stopped.
+    ///
+    /// This method checks if the UART transmission is stopped by examining
+    /// the TTY flow control state and hardware stop flag.
+    ///
+    /// # Returns
+    /// `true` if the UART transmission is stopped, `false` otherwise.
     #[inline]
     pub fn uart_tx_stopped(&self) -> bool{
         let ptr = self.as_ptr();
@@ -196,6 +197,17 @@ impl UartPort {
         false
     }
 
+    /// Handles the SysRq (System Request) character.
+    ///
+    /// This method processes a SysRq character if the SysRq feature is enabled
+    /// and the character is received within the timeout period. It handles the
+    /// SysRq command and resets the SysRq timeout.
+    ///
+    /// # Parameters
+    /// - `ch`: The SysRq character to handle.
+    ///
+    /// # Returns
+    /// `true` if the character was handled as a SysRq command, `false` otherwise.
     #[inline]
     pub fn uart_handle_sysrq_char(&self, ch: u8) -> bool {
         let ptr = self.as_ptr();
@@ -223,6 +235,15 @@ impl UartPort {
         return false;
     }
 
+    /// Handles a UART break condition.
+    ///
+    /// This method processes a break condition by calling the break handler function
+    /// if one is defined. It also handles the SysRq break feature if enabled and
+    /// checks for the SAK (Secure Attention Key) flag to perform the appropriate
+    /// action.
+    ///
+    /// # Returns
+    /// `true` if the break was handled, `false` otherwise.
     #[inline]
     pub fn uart_handle_break(&self) -> bool {
         let ptr = self.as_ptr();
@@ -312,7 +333,6 @@ impl<T: UartPortOps> PortRegistration<T> {
         self: Pin<&mut Self>,
         dev: &dyn device::RawDevice,
         uart: &'static UartDriver,
-        index: usize,
         data: T::Data,
     ) -> Result {
         // SAFETY: We never move out of `this`.
@@ -321,7 +341,7 @@ impl<T: UartPortOps> PortRegistration<T> {
             pr_warn!("this uart port driver is already registered\n");
             return Err(EINVAL);
         }
-        let mut port = &mut this.uart_port;
+        let port = &mut this.uart_port;
         port.0.dev = dev.raw_device();
         // port.irq = irq;
         // port.membase = membase;
