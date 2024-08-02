@@ -4,6 +4,8 @@
 //!
 //! 基于由ARM Ltd/Deep Blue Solutions Ltd编写的C驱动程序。
 
+#![allow(unused)]
+
 use kernel::{
     bindings,  // 内核绑定
     prelude::*,  // 导入内核预导入模块
@@ -75,9 +77,9 @@ const UART_CONFIG_TYPE: i32 = 1 << 0;
 const CONFIG_OF: i32 = 1;
 
 // 设备名称
-const DEV_NAME: &CStr = c_str!("ttyAMA");
+const DEV_NAME: &CStr = c_str!("cstery");
 // 驱动程序名称
-const DRIVER_NAME: &CStr = c_str!("ttyAMA");
+const DRIVER_NAME: &CStr = c_str!("cstery");
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -94,10 +96,10 @@ pub(crate) static mut PORTS: [Option<UartPort>; UART_NR] = [None; UART_NR];
 // AMBA UART控制台的静态结构体
 static AMBA_CONSOLE: Console = {
     let name: [i8; 16usize] = [
-        't' as _, 't' as _, 'y' as _, 'A' as _, 'M' as _, 'A' as _,
+        'c' as _, 's' as _, 't' as _, 'e' as _, 'r' as _, 'y' as _,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
-    Console::new::<Pl011Console>(name, UART_DRIVER.as_ptr())
+    Console::new::<Pl011Console>(name, unsafe { UART_DRIVER.as_ptr() })
         .with_config(
             (flags::CON_PRINTBUFFER | flags::CON_ANYTIME) as _,
             -1, 0, 0, 0, 0, 0,
@@ -105,7 +107,7 @@ static AMBA_CONSOLE: Console = {
 };
 
 // UART驱动程序的静态结构体
-pub(crate) static UART_DRIVER: UartDriver = UartDriver::new(
+pub(crate) static mut UART_DRIVER: UartDriver = UartDriver::new(
     &THIS_MODULE,
     DRIVER_NAME,
     DEV_NAME,
@@ -201,8 +203,7 @@ impl Pl011Console {
 
         // 如果有平台特定的数据，执行其初始化
         if unsafe { !((*uap_ptr.dev).platform_data.is_null()) } {
-
-            let plat = unsafe { &*((*uap_ptr.dev).platform_data as *mut AmbaPl011Data)};
+            let plat = unsafe { &*((*uap_ptr.dev).platform_data as *mut AmbaPl011Data) };
             if let Some(init_func) = plat.init {
                 init_func();  // 调用平台数据中的初始化函数
             }
@@ -501,6 +502,7 @@ impl AmbaPl011Pops {
     /// pl011寄存器写入函数
     fn pl011_write(val: u32, port: &UartPort, reg: usize) {
         let port_ptr = unsafe { &*port.as_ptr() };
+
         let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
 
         if u32::from(port_ptr.iotype) == UPIO_MEM32 {
@@ -594,8 +596,7 @@ impl AmbaPl011Pops {
 
         // 如果有平台特定的数据，执行其初始化
         if unsafe { !((*port_ptr.dev).platform_data.is_null()) } {
-
-            let plat = unsafe { &*((*port_ptr.dev).platform_data as *mut AmbaPl011Data)};
+            let plat = unsafe { &*((*port_ptr.dev).platform_data as *mut AmbaPl011Data) };
             if let Some(init_func) = plat.init {
                 init_func();
             }
@@ -621,7 +622,7 @@ impl AmbaPl011Pops {
                     ch &= !(UART011_DR_FE | UART011_DR_PE);
                     port_ptr.icount.brk += 1;
                     if port.uart_handle_break() {
-                        fifotaken+=1;
+                        fifotaken += 1;
                         continue;
                     }
                 } else if ch & UART011_DR_PE != 0 {
@@ -664,7 +665,7 @@ impl AmbaPl011Pops {
                 }
             }
 
-            fifotaken+=1;
+            fifotaken += 1;
         }
         return fifotaken;
     }
@@ -1318,8 +1319,7 @@ impl UartPortOps for AmbaPl011Pops {
         pinctrl_pm_select_sleep_state(&dev);  // 未知!!!!! ../linux_raspberrypi/include/linux/pinctrl/consumer.h
 
         if unsafe { !((*port_ptr.dev).platform_data.is_null()) } {
-
-            let plat = unsafe { &*((*port_ptr.dev).platform_data as *mut AmbaPl011Data)};
+            let plat = unsafe { &*((*port_ptr.dev).platform_data as *mut AmbaPl011Data) };
             if let Some(exit_func) = plat.exit {
                 exit_func();  // 调用平台数据中的初始化函数
             }
@@ -1622,7 +1622,7 @@ impl driver::DeviceRemoval for AmbaDeviceData {
 
 // 定义AMBA ID表
 kernel::define_amba_id_table! {MY_AMDA_ID_TABLE, (), [
-    ({id: 0x00041011, mask: 0x000fffff}, None),
+    ({id: 0x00041014, mask: 0x000fffff}, None),
 ]}
 // 定义模块的AMBA ID表
 kernel::module_amba_id_table!(UART_MOD_TABLE, MY_AMDA_ID_TABLE);
@@ -1668,12 +1668,12 @@ impl amba::Driver for PL011Device {
         let has_sysrq = 1;
         // 设置标志
         let flags = UPF_BOOT_AUTOCONF;
-        // 创建并设置串口端口
-        let mut uap = UartPort::new();
 
         let dev = device::Device::from_dev(adev);
         let index = pl011_probe_dt_alias(portnr as _, dev.clone());
-        uap.setup(
+
+        // 创建并设置串口端口
+        let mut uap = UartPort::new().setup(
             membase,
             mapbase,
             irq,
@@ -1684,19 +1684,12 @@ impl amba::Driver for PL011Device {
             index as _,
         );
 
-        // 未知!!!!! 麻烦、复杂
-        let mut type_: [u8; 12] = [0; 12];
         // 设置端口类型
         let rev = adev.revision_get().unwrap();
-        let type_str = CString::try_from_fmt(fmt!("PL011 rev{}", rev)).unwrap();
-        // 将格式化的字符串复制到 uap.type 中
-        let bytes = type_str.as_bytes_with_nul(); // 包含 NUL 终止符
-        let len = bytes.len().min(type_.len());
-        type_[..len].copy_from_slice(&bytes[..len]);
-        // 手动填充剩余部分为 0
-        for byte in &mut type_[len..] {
-            *byte = 0;
-        }
+        let type_: [u8; 12] = [
+            'P' as _, 'L' as _, '0' as _, '1' as _, '1' as _, ' ' as _,
+            'r' as _, 'e' as _, 'v' as _, (rev + 48) as _, 0, 0,
+        ];
 
         let pl011_data = PL011Data {
             im: 0,
@@ -1714,23 +1707,30 @@ impl amba::Driver for PL011Device {
             parent_irq: irq,
         };
 
-        unsafe { PORTS[portnr as usize] = Some(uap) };
-
-        let pl011_device_data = new_device_data!(PortRegistration::<AmbaPl011Pops>::new(uap), pl011_resources, pl011_data, "ttyAMA")?;  // 未知!!!!!  可能有问题
+        let pl011_device_data = new_device_data!(PortRegistration::<AmbaPl011Pops>::new(uap), pl011_resources, pl011_data, "cstery")?;  // 未知!!!!!  可能有问题
 
         /* 确保该 UART 的中断被屏蔽和清除 */
         AmbaPl011Pops::pl011_write(0, &uap, Register::RegImsc as usize); // 屏蔽中断
         AmbaPl011Pops::pl011_write(0xffff, &uap, Register::RegIcr as usize); // 清除中断
 
-        amba_set_drvdata(dev.clone(), &mut uap);
+        // amba_set_drvdata(dev.clone(), &mut uap);
 
-        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
+        let pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
         let pl011_registrations_pin = pin!(pl011_registrations);
-        pl011_registrations_pin.register(
-            adev,
-            &UART_DRIVER,
-            Box::try_new(pl011_data)?,
-        )?;
+
+        unsafe {
+            if (*UART_DRIVER.as_ptr()).state.is_null() {
+                &UART_DRIVER.register()?;
+            }
+
+            pl011_registrations_pin.register(
+                adev,
+                &UART_DRIVER,
+                Box::try_new(pl011_data)?,
+            )?;
+        }
+
+        unsafe { PORTS[portnr as usize] = Some(uap) };
 
         dbg!("********* PL061 GPIO芯片已注册 *********\n");
         Ok(Box::try_new(
@@ -1747,12 +1747,20 @@ impl amba::Driver for PL011Device {
 
 
 // 注册AMBA驱动程序
-module_amba_driver! {
-    type: PL011Device,
+// module_amba_driver! {
+//     type: PL011Device,
+//     name: "pl011_uart",
+//     author: "Fan",
+//     license: "GPL",
+//     initcall: "arch",
+// }
+
+module! {
+    type: Pl011uartMod,
     name: "pl011_uart",
     author: "Fan",
+    description: "Rust for linux pl011 uart driver demo",
     license: "GPL",
-    initcall: "arch",
 }
 
 /// 查找可用的驱动端口。
@@ -1809,3 +1817,26 @@ fn amba_set_drvdata(dev: device::Device, uap: &mut UartPort) {
 }
 
 
+// 定义 Pl011uartMod 结构体，用于内核模块管理
+struct Pl011uartMod {
+    _dev: Pin<Box<driver::Registration::<amba::Adapter<PL011Device>>>>,
+}
+
+// 为Pl011uartMod实现内核模块的trait
+impl kernel::Module for Pl011uartMod {
+    fn init(module: &'static ThisModule) -> Result<Self> {
+        pr_info!("Example of Kernel's Pl011uart mechanism (init)\n"); // 模块初始化时打印信息
+
+        let d = driver::Registration::<amba::Adapter<PL011Device>>::new_pinned(DRIVER_NAME, module)?;
+
+        Ok(Pl011uartMod { _dev: d })
+    }
+}
+
+// 实现 Drop 特征以处理模块卸载时的清理操作
+impl Drop for Pl011uartMod {
+    // 在模块卸载时打印日志
+    fn drop(&mut self) {
+        pr_info!("Rust for linux Pl011uart driver demo (exit)\n");
+    }
+}

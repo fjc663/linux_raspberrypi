@@ -22,7 +22,7 @@ use core::{
     pin::Pin,
     mem::MaybeUninit,
 };
-
+use crate::pr_info;
 use macros::vtable;
 
 const CONFIG_HZ: u64 = 250;
@@ -297,6 +297,7 @@ impl UartPort {
         self.0.line = index;
         self.0.has_sysrq = has_sysrq;
         self.0.fifosize = fifosize;
+
         self
     }
 }

@@ -98,8 +98,8 @@ impl UartDriver {
     pub fn register(&self) -> Result {
         unsafe {
             to_result(bindings::uart_register_driver(self.as_ptr()))?;  // 调用内核函数注册UART驱动程序
-            Ok(())
         }
+        Ok(())
     }
 
 }
