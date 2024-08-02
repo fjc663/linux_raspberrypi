@@ -1707,7 +1707,7 @@ impl amba::Driver for PL011Device {
             parent_irq: irq,
         };
 
-        let pl011_device_data = new_device_data!(PortRegistration::<AmbaPl011Pops>::new(uap), pl011_resources, pl011_data, "cstery")?;  // 未知!!!!!  可能有问题
+        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
 
         /* 确保该 UART 的中断被屏蔽和清除 */
         AmbaPl011Pops::pl011_write(0, &uap, Register::RegImsc as usize); // 屏蔽中断
@@ -1715,24 +1715,26 @@ impl amba::Driver for PL011Device {
 
         // amba_set_drvdata(dev.clone(), &mut uap);
 
-        let pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
-        let pl011_registrations_pin = pin!(pl011_registrations);
+        // let pl011_registrations_pin = pin!(PortRegistration::<AmbaPl011Pops>::new(uap));
 
         unsafe {
             if (*UART_DRIVER.as_ptr()).state.is_null() {
                 &UART_DRIVER.register()?;
             }
-
-            pl011_registrations_pin.register(
-                adev,
-                &UART_DRIVER,
-                Box::try_new(pl011_data)?,
-            )?;
         }
+
+        &pl011_registrations.register(
+            adev,
+            unsafe { &UART_DRIVER },
+            Box::try_new(pl011_data)?,
+        )?;
 
         unsafe { PORTS[portnr as usize] = Some(uap) };
 
+        let pl011_device_data = new_device_data!(pl011_registrations, pl011_resources, pl011_data, "cstery")?;  // 未知!!!!!  可能有问题
+
         dbg!("********* PL061 GPIO芯片已注册 *********\n");
+
         Ok(Box::try_new(
             AmbaDeviceData {
                 inner: pl011_device_data,
@@ -1747,21 +1749,21 @@ impl amba::Driver for PL011Device {
 
 
 // 注册AMBA驱动程序
-// module_amba_driver! {
-//     type: PL011Device,
-//     name: "pl011_uart",
-//     author: "Fan",
-//     license: "GPL",
-//     initcall: "arch",
-// }
-
-module! {
-    type: Pl011uartMod,
+module_amba_driver! {
+    type: PL011Device,
     name: "pl011_uart",
     author: "Fan",
-    description: "Rust for linux pl011 uart driver demo",
     license: "GPL",
+    initcall: "arch",
 }
+
+// module! {
+//     type: Pl011uartMod,
+//     name: "pl011_uart",
+//     author: "Fan",
+//     description: "Rust for linux pl011 uart driver demo",
+//     license: "GPL",
+// }
 
 /// 查找可用的驱动端口。
 fn pl011_find_free_port() -> Result<usize> {
@@ -1818,25 +1820,27 @@ fn amba_set_drvdata(dev: device::Device, uap: &mut UartPort) {
 
 
 // 定义 Pl011uartMod 结构体，用于内核模块管理
-struct Pl011uartMod {
-    _dev: Pin<Box<driver::Registration::<amba::Adapter<PL011Device>>>>,
-}
+
+// 下面代码使用module!有用，使用module_amba_driver!无效
+// struct Pl011uartMod {
+//     _dev: Pin<Box<driver::Registration::<amba::Adapter<PL011Device>>>>,
+// }
 
 // 为Pl011uartMod实现内核模块的trait
-impl kernel::Module for Pl011uartMod {
-    fn init(module: &'static ThisModule) -> Result<Self> {
-        pr_info!("Example of Kernel's Pl011uart mechanism (init)\n"); // 模块初始化时打印信息
-
-        let d = driver::Registration::<amba::Adapter<PL011Device>>::new_pinned(DRIVER_NAME, module)?;
-
-        Ok(Pl011uartMod { _dev: d })
-    }
-}
+// impl kernel::Module for Pl011uartMod {
+//     fn init(module: &'static ThisModule) -> Result<Self> {
+//         pr_info!("Example of Kernel's Pl011uart mechanism (init)\n"); // 模块初始化时打印信息
+//
+//         let d = driver::Registration::<amba::Adapter<PL011Device>>::new_pinned(DRIVER_NAME, module)?;
+//
+//         Ok(Pl011uartMod { _dev: d })
+//     }
+// }
 
 // 实现 Drop 特征以处理模块卸载时的清理操作
-impl Drop for Pl011uartMod {
-    // 在模块卸载时打印日志
-    fn drop(&mut self) {
-        pr_info!("Rust for linux Pl011uart driver demo (exit)\n");
-    }
-}
+// impl Drop for Pl011uartMod {
+//     // 在模块卸载时打印日志
+//     fn drop(&mut self) {
+//         pr_info!("Rust for linux Pl011uart driver demo (exit)\n");
+//     }
+// }

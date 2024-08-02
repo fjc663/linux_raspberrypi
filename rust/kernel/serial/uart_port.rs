@@ -22,7 +22,6 @@ use core::{
     pin::Pin,
     mem::MaybeUninit,
 };
-use crate::pr_info;
 use macros::vtable;
 
 const CONFIG_HZ: u64 = 250;
@@ -331,13 +330,15 @@ impl<T: UartPortOps> PortRegistration<T> {
     ///
     /// use `uart_add_one_port` to register this device.
     pub fn register(
-        self: Pin<&mut Self>,
+        // self: Pin<&mut Self>,
+        &mut self,
         dev: &dyn device::RawDevice,
         uart: &'static UartDriver,
         data: T::Data,
     ) -> Result {
         // SAFETY: We never move out of `this`.
-        let this = unsafe { self.get_unchecked_mut() };
+        // let this = unsafe { self.get_unchecked_mut() };
+        let mut this = self;
         if this.is_registered {
             pr_warn!("this uart port driver is already registered\n");
             return Err(EINVAL);
