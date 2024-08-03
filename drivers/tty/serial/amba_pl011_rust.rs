@@ -124,6 +124,7 @@ struct Pl011Console;
 impl Pl011Console {
     // 向 UART 发送一个字符
     extern "C" fn pl011_console_putchar(port_ptr: *mut bindings::uart_port, ch: c_uchar) {
+        pr_info!("****pl011_console_putchar****\n");
         let uap = unsafe { &UartPort::from_raw(port_ptr) };
         while AmbaPl011Pops::pl011_read(uap, Register::RegFr as usize) & UART01X_FR_TXFF != 0 {
             cpu_relax(); // CPU 进入低功耗状态
@@ -132,6 +133,7 @@ impl Pl011Console {
     }
 
     fn pl011_console_get_options(uap: &UartPort, baud: &mut i32, parity: &mut i32, bits: &mut i32) {
+        pr_info!("****pl011_console_get_options****\n");
         if AmbaPl011Pops::pl011_read(uap, Register::RegCr as usize) & UART01X_CR_UARTEN != 0 {  // 检查 UART 是否启用
             let lcr_h = AmbaPl011Pops::pl011_read(uap, Register::RegLcrhTx as usize); // 读取行控制寄存器
 
@@ -168,6 +170,7 @@ impl Pl011Console {
     }
 
     fn pl011_console_setup(co: &Console, options: *mut i8) -> Result<i32> {
+        pr_info!("****pl011_console_setup****\n");
         let mut baud: i32 = 38400;  // 默认波特率
         let mut bits: i32 = 8; // 默认数据位
         let mut parity: i32 = 'n' as i32; // 默认无奇偶校验
@@ -243,6 +246,7 @@ impl ConsoleOps for Pl011Console {
     type Data = ();
 
     fn console_write(co: &Console, s: *const i8, count: u32) {
+        pr_info!("****console_write****\n");
         let co_ptr = unsafe { &*co.as_ptr() };
         // 获取 UART 端口
         let uap = &unsafe { &PORTS[co_ptr.index as usize] }.unwrap();
@@ -308,6 +312,7 @@ impl ConsoleOps for Pl011Console {
     }
 
     fn console_read(_co: &Console, _s: *mut i8, _count: u32) -> Result<i32> {
+        pr_info!("****console_read****\n");
         pr_info!("console_read ok");
         Ok(0)
     }
@@ -319,6 +324,7 @@ impl ConsoleOps for Pl011Console {
         options: *mut i8,
     ) -> Result<i32>
     {
+        pr_info!("****console_match****\n");
         let mut iotype: c_uchar = 0;
         let mut addr: bindings::resource_size_t = 0;
 
@@ -373,6 +379,7 @@ impl ConsoleOps for Pl011Console {
     }
 
     fn console_device(_co: &Console, _index: *mut i8) -> *mut bindings::tty_driver {
+        pr_info!("****console_device****\n");
         pr_info!("console_device ok");
         todo!()
     }
@@ -419,6 +426,7 @@ impl irq::Handler for Pl011Handler {
     type Data = Box<UartPort>;
 
     fn handle_irq(data: &UartPort) -> irq::Return {
+        pr_info!("****handle_irq****\n");
         let port_ptr = unsafe { &*data.as_ptr() };
         let mut handled = false;
         let mut pass_counter = AMBA_ISR_PASS_LIMIT;
@@ -486,10 +494,12 @@ struct AmbaPl011Pops;
 
 impl AmbaPl011Pops {
     fn pl011_reg_to_offset(reg: usize) -> usize {
+        pr_info!("****pl011_reg_to_offset****\n");
         PL011_STD_OFFSETS[reg] as usize
     }
 
     fn pl011_read(port: &UartPort, reg: usize) -> u32 {
+        pr_info!("****pl011_read****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
         if u32::from(port_ptr.iotype) == UPIO_MEM32 {
@@ -501,6 +511,7 @@ impl AmbaPl011Pops {
 
     /// pl011寄存器写入函数
     fn pl011_write(val: u32, port: &UartPort, reg: usize) {
+        pr_info!("****pl011_write****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
@@ -513,6 +524,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_rs485_tx_start(port: &UartPort) {
+        pr_info!("****pl011_rs485_tx_start****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let mut cr: u32 = Self::pl011_read(port, Register::RegCr as usize);
@@ -549,6 +561,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_start_tx_pio(port: &UartPort) {
+        pr_info!("****pl011_start_tx_pio****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -561,6 +574,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_stop_rx(port: &UartPort, pl011_data: &mut PL011Data) {
+        pr_info!("****pl011_stop_rx****\n");
         // 清除中断掩码寄存器 (IMSC) 中的接收相关中断位
         pl011_data.im &= !(UART011_RXIM | UART011_RTIM | UART011_FEIM |
             UART011_PEIM | UART011_BEIM | UART011_OEIM);
@@ -570,6 +584,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_hwinit(port: &UartPort, pl011_data: &mut PL011Data) -> Result {
+        pr_info!("****pl011_hwinit****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let dev = unsafe { device::Device::new(port_ptr.dev) };
 
@@ -605,6 +620,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_fifo_to_tty(port: &UartPort) -> i32 {
+        pr_info!("****pl011_fifo_to_tty****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let mut fifotaken = 0;
         while fifotaken != 255 {
@@ -671,6 +687,7 @@ impl AmbaPl011Pops {
     }
 
     fn check_apply_cts_event_workaround(port: &UartPort) {
+        pr_info!("****check_apply_cts_event_workaround****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -690,6 +707,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_rx_chars(port: &UartPort) {
+        pr_info!("****pl011_rx_chars****\n");
         Self::pl011_fifo_to_tty(port);
 
         let port_ptr = unsafe { &mut *port.as_ptr() };
@@ -701,6 +719,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_modem_status(port: &UartPort) {
+        pr_info!("****pl011_modem_status****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -744,6 +763,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_tx_char(port: &UartPort, c: u8, from_irq: bool) -> bool {
+        pr_info!("****pl011_tx_char****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         // 检查如果不是从中断上下文调用，并且 UART 的发送 FIFO 已满，则无法发送字符
         if !from_irq && (Self::pl011_read(port, Register::RegFr as usize) & UART01X_FR_TXFF != 0) {
@@ -764,6 +784,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_stop_tx(port: &UartPort) {
+        pr_info!("****pl011_stop_tx****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -777,6 +798,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_tx_chars(port: &UartPort, from_irq: bool) -> bool {
+        pr_info!("****pl011_tx_chars****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -856,10 +878,12 @@ impl AmbaPl011Pops {
     }
 
     fn request_irq(irq: u32, data: Box<UartPort>) -> Result<irq::Registration<Pl011Handler>> {
+        pr_info!("****request_irq****\n");
         irq::Registration::try_new(irq, data, irq::flags::SHARED, fmt!("uart-pl011"))
     }
 
     fn pl011_allocate_irq(port: &UartPort, pl011_data: &mut PL011Data) -> Result<irq::Registration<Pl011Handler>> {
+        pr_info!("****pl011_allocate_irq****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         Self::pl011_write(pl011_data.im, port, Register::RegImsc as usize);
@@ -867,6 +891,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_enable_interrupts(port: &UartPort) {
+        pr_info!("****pl011_enable_interrupts****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -894,6 +919,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_disable_interrupts(port: &UartPort, pl011_data: &mut PL011Data) {
+        pr_info!("****pl011_disable_interrupts****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         // 加锁以保护对 CR 寄存器的访问
@@ -908,6 +934,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_rs485_tx_stop(port: &UartPort) {
+        pr_info!("****pl011_rs485_tx_stop****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -946,17 +973,20 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_shutdown_channel(port: &UartPort, lcrh: usize) {
+        pr_info!("****pl011_shutdown_channel****\n");
         let mut val = Self::pl011_read(port, lcrh);
         val &= !(UART01X_LCRH_BRK | UART01X_LCRH_FEN);
         Self::pl011_write(val, port, lcrh);
     }
 
     fn pl011_split_lcrh() -> bool {
+        pr_info!("****pl011_split_lcrh****\n");
         Self::pl011_reg_to_offset(Register::RegLcrhRx as usize) !=
             Self::pl011_reg_to_offset(Register::RegLcrhTx as usize)
     }
 
     fn pl011_disable_uart(port: &UartPort) {
+        pr_info!("****pl011_disable_uart****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
 
         port_ptr.status &= !(UPSTAT_AUTOCTS | UPSTAT_AUTORTS);
@@ -982,6 +1012,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_setup_status_masks(port: &UartPort, new: *mut bindings::ktermios) {
+        pr_info!("****pl011_setup_status_masks****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
 
         port_ptr.read_status_mask = UART011_DR_OE | 255;
@@ -1021,6 +1052,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_enable_ms(port: &UartPort) {
+        pr_info!("****pl011_enable_ms****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Box<PL011Data> as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1035,6 +1067,7 @@ impl AmbaPl011Pops {
     }
 
     fn pl011_write_lcr_h(port: &UartPort, lcr_h: u32) {
+        pr_info!("****pl011_write_lcr_h****\n");
         Self::pl011_write(lcr_h, port, Register::RegLcrhRx as usize);
         if Self::pl011_split_lcrh() {
             /*
@@ -1051,6 +1084,7 @@ impl AmbaPl011Pops {
 
     #[cfg(CONFIG_CONSOLE_POLL)]
     fn pl011_quiesce_irqs(port: &UartPort) {
+        pr_info!("****pl011_quiesce_irqs****\n");
         Self::pl011_write(Self::pl011_read(port, Register::RegMis as usize), port, Register::RegIcr as usize);
         /*
          * 无法清除 TXIM，因为这是“准备传输中断”，所以我们只需屏蔽它。start_tx() 将会取消屏蔽它。
@@ -1071,6 +1105,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @tx_empty:      check if the UART TX FIFO is empty
     fn tx_empty(port: &UartPort) -> u32 {
+        pr_info!("****tx_empty****\n");
         let status = Self::pl011_read(port, Register::RegFr as usize) ^ VENDOR_DATA.inv_fr;
         if status & (VENDOR_DATA.fr_busy | UART01X_FR_TXFF) == 1 {
             0
@@ -1081,6 +1116,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @set_mctrl:    set the modem control register
     fn set_mctrl(port: &UartPort, mctrl: u32) {
+        pr_info!("****set_mctrl****\n");
         // 读取当前的控制寄存器值
         let mut cr = Self::pl011_read(port, Register::RegCr as usize);
 
@@ -1112,6 +1148,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @get_mctrl:    get the modem control register
     fn get_mctrl(port: &UartPort) -> u32 {
+        pr_info!("****get_mctrl****\n");
         let mut result: u32 = 0;
         let status = Self::pl011_read(port, Register::RegFr as usize);
 
@@ -1133,6 +1170,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @stop_tx:      stop transmitting
     fn stop_tx(port: &UartPort) {
+        pr_info!("****stop_tx****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let mut pl011_data: Box<PL011Data> = unsafe {
@@ -1144,6 +1182,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @start_tx:    start transmitting
     fn start_tx(port: &UartPort) {
+        pr_info!("****start_tx****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1160,6 +1199,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @throttle:     stop receiving
     fn throttle(port: &UartPort) {
+        pr_info!("****throttle****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let mut pl011_data: Box<PL011Data> = unsafe {
@@ -1178,6 +1218,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @unthrottle:   start receiving
     fn unthrottle(port: &UartPort) {
+        pr_info!("****unthrottle****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let mut pl011_data: Box<PL011Data> = unsafe {
@@ -1197,16 +1238,23 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @send_xchar:  send a break character
-    fn send_xchar(_port: &UartPort, _ch: i8) {}
+    fn send_xchar(_port: &UartPort, _ch: i8) {
+        pr_info!("****send_xchar****\n");
+    }
 
     /// * @stop_rx:      stop receiving
-    fn stop_rx(_port: &UartPort) {}
+    fn stop_rx(_port: &UartPort) {
+        pr_info!("****stop_rx****\n");
+    }
 
     /// * @start_rx:    start receiving
-    fn start_rx(_port: &UartPort) {}
+    fn start_rx(_port: &UartPort) {
+        pr_info!("****start_rx****\n");
+    }
 
     /// * @enable_ms:    enable modem status interrupts
     fn enable_ms(port: &UartPort) {
+        pr_info!("****enable_ms****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
 
         let mut pl011_data: Box<PL011Data> = unsafe {
@@ -1222,6 +1270,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @break_ctl:   set the break control
     fn break_ctl(port: &UartPort, ctl: i32) {
+        pr_info!("****break_ctl****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         // 进入临界区，保存当前中断状态并禁止中断，以确保线程安全
         unsafe { bindings::spin_lock(&port_ptr.lock as *const _ as *mut _) };
@@ -1244,6 +1293,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @startup:      start the UART
     fn startup(port: &UartPort) -> i32 {
+        pr_info!("****startup****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1294,6 +1344,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @shutdown:     shutdown the UART
     fn shutdown(port: &UartPort) {
+        pr_info!("****shutdown****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1333,7 +1384,9 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @flush_buffer: flush the UART buffer
-    fn flush_buffer(_port: &UartPort) {}
+    fn flush_buffer(_port: &UartPort) {
+        pr_info!("****flush_buffer****\n");
+    }
 
     /// * @set_termios: set the termios structure
     fn set_termios(
@@ -1342,6 +1395,7 @@ impl UartPortOps for AmbaPl011Pops {
         old: *const bindings::ktermios,
     )
     {
+        pr_info!("****set_termios****\n");
         let port_ptr = unsafe { &mut *port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1500,13 +1554,18 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @set_ldisc:    set the line discipline
-    fn set_ldisc(_port: &UartPort, _arg2: *mut bindings::ktermios) {}
+    fn set_ldisc(_port: &UartPort, _arg2: *mut bindings::ktermios) {
+        pr_info!("****set_ldisc****\n");
+    }
 
     /// * @pm:            power management
-    fn pm(_port: &UartPort, _state: u32, _oldstate: u32) {}
+    fn pm(_port: &UartPort, _state: u32, _oldstate: u32) {
+        pr_info!("****pm****\n");
+    }
 
     /// * @type:          get the type of the UART
     fn port_type(port: &UartPort) -> *const i8 {
+        pr_info!("****port_type****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1522,15 +1581,19 @@ impl UartPortOps for AmbaPl011Pops {
     }
 
     /// * @release_port: release the UART port
-    fn release_port(_uart_port: &UartPort) {}
+    fn release_port(_uart_port: &UartPort) {
+        pr_info!("****release_port****\n");
+    }
 
     /// * @request_port: request the UART port
     fn request_port(_uart_port: &UartPort) -> i32 {
+        pr_info!("****request_port****\n");
         todo!();
     }
 
     /// * @config_port:  configure the UART port
     fn config_port(uart_port: &UartPort, flags: i32) {
+        pr_info!("****config_port****\n");
         if flags & UART_CONFIG_TYPE != 0 {
             let port_ptr = unsafe { &mut *uart_port.as_ptr() };
             port_ptr.type_ = PORT_AMBA;
@@ -1539,6 +1602,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @verify_port:  verify the UART port
     fn verify_port(uart_port: &UartPort, ser: *mut bindings::serial_struct) -> i32 {
+        pr_info!("****verify_port****\n");
         let port_ptr = unsafe { &*uart_port.as_ptr() };
         let mut ret: i32 = 0;
         if unsafe { (*ser).type_ != bindings::PORT_UNKNOWN as i32 && (*ser).type_ != bindings::PORT_AMBA as i32 } {
@@ -1559,11 +1623,13 @@ impl UartPortOps for AmbaPl011Pops {
 
     /// * @ioctl:        ioctl handler
     fn ioctl(_uart_port: &UartPort, _arg2: u32, _arg3: u64) -> i32 {
+        pr_info!("****ioctl****\n");
         todo!();
     }
 
     #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_init(uart_port: &UartPort) -> i32 {
+        pr_info!("****poll_init****\n");
         let port_ptr = unsafe { &*uart_port.as_ptr() };
         let mut pl011_data: Box<PL011Data> = unsafe {
             <Self::Data as ForeignOwnable>::from_foreign(port_ptr.private_data)
@@ -1577,6 +1643,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_put_char(uart_port: &UartPort, arg2: u8) {
+        pr_info!("****poll_put_char****\n");
         // 等待传输队列不满
         while Self::pl011_read(uart_port, Register::RegFr as usize) & UART01X_FR_TXFF != 0 {
             // 放松 CPU，以防止忙等待导致 CPU 过度消耗
@@ -1589,6 +1656,7 @@ impl UartPortOps for AmbaPl011Pops {
 
     #[cfg(CONFIG_CONSOLE_POLL)]
     fn poll_get_char(uart_port: &UartPort) -> i32 {
+        pr_info!("****poll_get_char****\n");
         /*
          * The caller might need IRQs lowered, e.g. if used with KDB NMI
          * debugger.
@@ -1671,6 +1739,7 @@ impl amba::Driver for PL011Device {
 
         let dev = device::Device::from_dev(adev);
         let index = pl011_probe_dt_alias(portnr as _, dev.clone());
+        dev_info!(adev,"index is {}\n", index);
 
         // 创建并设置串口端口
         let mut uap = UartPort::new().setup(
@@ -1720,6 +1789,23 @@ impl amba::Driver for PL011Device {
         unsafe {
             if (*UART_DRIVER.as_ptr()).state.is_null() {
                 &UART_DRIVER.register()?;
+
+                // 注册成功后打印状态信息
+                let state_ptr = (*UART_DRIVER.as_ptr()).state; // 获取状态指针
+                let nr = (*UART_DRIVER.as_ptr()).nr; // 获取状态数量
+
+                pr_info!("UART driver registered successfully. State pointer: {:?}", state_ptr);
+
+                // 打印每个 uart_state 的信息
+                for i in 0..nr {
+                    let uart_state = &*state_ptr.add(i as usize); // 取得 uart_state
+                    pr_info!("UART State{}: port={:p}, ops={:p}, uart_port={:p}\n",
+                            i,
+                            &uart_state.port,
+                            uart_state.port.ops,
+                            uart_state.uart_port,
+                    );
+                }
             }
         }
 
@@ -1729,7 +1815,7 @@ impl amba::Driver for PL011Device {
             Box::try_new(pl011_data)?,
         )?;
 
-        unsafe { PORTS[portnr as usize] = Some(uap) };
+        unsafe { PORTS[index as usize] = Some(uap) };
 
         let pl011_device_data = new_device_data!(pl011_registrations, pl011_resources, pl011_data, "cstery")?;  // 未知!!!!!  可能有问题
 
@@ -1767,6 +1853,7 @@ module_amba_driver! {
 
 /// 查找可用的驱动端口。
 fn pl011_find_free_port() -> Result<usize> {
+    pr_info!("****pl011_find_free_port****\n");
     for (index, port) in unsafe { PORTS.iter().enumerate() } {
         if let None = port {
             return Ok(index);
@@ -1777,6 +1864,7 @@ fn pl011_find_free_port() -> Result<usize> {
 
 // 查找设备树别名函数
 fn pl011_probe_dt_alias(index: i32, dev: device::Device) -> i32 {
+    pr_info!("****pl011_probe_dt_alias****\n");
     let mut seen_dev_with_alias: bool = false; // 标记是否存在别名设备
     let mut seen_dev_without_alias: bool = false; // 标记是否存在无别名设备
     let mut ret = index;
@@ -1814,6 +1902,7 @@ fn pl011_probe_dt_alias(index: i32, dev: device::Device) -> i32 {
 
 // 将私有数据设置到设备结构体中
 fn amba_set_drvdata(dev: device::Device, uap: &mut UartPort) {
+    pr_info!("****amba_set_drvdata****\n");
     let dev_ptr = dev.raw_device();
     unsafe { (*dev_ptr).driver_data = uap.as_ptr() as *mut _ };
 }
