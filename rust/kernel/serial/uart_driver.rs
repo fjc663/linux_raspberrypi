@@ -123,8 +123,8 @@ impl UartDriverRef {
     ///
     /// # 返回
     /// 指向`uart_driver`的原始指针
-    #[warn(dead_code)]
-    fn as_ptr(&self) -> *mut bindings::uart_driver {
+    #[inline]
+    pub fn as_ptr(&self) -> *mut bindings::uart_driver {
         self.0
     }
 }

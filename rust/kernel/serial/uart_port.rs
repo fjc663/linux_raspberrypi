@@ -304,6 +304,7 @@ impl UartPort {
 /// A registration of a reset controller.
 pub struct PortRegistration<T: UartPortOps> {
     uart_port: UartPort,
+    uart_port_ptr: *mut bindings::uart_port,
     dev: Option<device::Device>,
     is_registered: bool,
     _p: PhantomData<T>,
@@ -315,11 +316,13 @@ impl<T: UartPortOps> PortRegistration<T> {
     ///
     /// It is allowed to move.
     pub fn new(
-       uap: UartPort
+       uap: UartPort,
     ) -> Self {
         Self {
             uart_port: uap,
+            uart_port_ptr: uap.as_ptr(),
             dev: None,
+            // uart_ref: uart_ref,
             is_registered: false,
             _p: PhantomData,
             _pin: PhantomPinned,
@@ -330,26 +333,20 @@ impl<T: UartPortOps> PortRegistration<T> {
     ///
     /// use `uart_add_one_port` to register this device.
     pub fn register(
-        // self: Pin<&mut Self>,
-        &mut self,
+        self: Pin<&mut Self>,
         dev: &dyn device::RawDevice,
         uart: &'static UartDriver,
         data: T::Data,
     ) -> Result {
         // SAFETY: We never move out of `this`.
-        // let this = unsafe { self.get_unchecked_mut() };
-        let mut this = self;
+        let this = unsafe { self.get_unchecked_mut() };
         if this.is_registered {
             pr_warn!("this uart port driver is already registered\n");
             return Err(EINVAL);
         }
         let port = &mut this.uart_port;
+
         port.0.dev = dev.raw_device();
-        // port.irq = irq;
-        // port.membase = membase;
-        // port.mapbase = mapbase;
-        // port.flags = flags;
-        // port.line = index;
         port.0.ops = Adapter::<T>::build();
         port.0.private_data = <T::Data as ForeignOwnable>::into_foreign(data) as *mut c_void;
 
@@ -359,9 +356,20 @@ impl<T: UartPortOps> PortRegistration<T> {
             dev_err!(dev, "Failed to add AMBA-PL011 port driver\n");
         }
 
+        this.uart_port_ptr = port.as_ptr();
         this.dev = Some(device::Device::from_dev(dev));
         this.is_registered = true;
         Ok(())
+    }
+
+    /// get_uart_port_ptr
+    pub fn get_uart_port_ptr(&self) -> *mut bindings::uart_port{
+        self.uart_port_ptr
+    }
+
+    /// get_uart_port
+    pub fn get_uart_port(&self) -> UartPort{
+        self.uart_port
     }
 }
 
@@ -369,7 +377,16 @@ impl<T: UartPortOps> Drop for PortRegistration<T> {
     fn drop(&mut self) {
         // Free data as well.
         // SAFETY: `data_pointer` was returned by `into_foreign` during registration.
-        pr_err!("uart port dropped.\n")
+
+        // let this = self;
+        // if !this.is_registered {
+        //     pr_warn!("this uart port driver is not registered\n");
+        // }
+        // let port = &mut this.uart_port;
+        // let uart:&UartDriverRef = &this.uart_ref;
+        // unsafe { bindings::uart_remove_one_port(uart.as_ptr(), port.as_ptr()) };
+
+        pr_warn!("uart port dropped.\n")
     }
 }
 

@@ -22,10 +22,10 @@ use kernel::{
     io_mem::IoMem,  // IO内存模块
     types::ForeignOwnable,
     delay::coarse_sleep,
-    sync::UniqueArc,
+    sync::{UniqueArc, Arc, Mutex},
     serial::{  // 串口模块
                uart_console::{Console, ConsoleOps, flags},  // 串口控制台相关模块，包括控制台、控制台操作和标志
-               uart_driver::UartDriver,  // 串口驱动模块
+               uart_driver::{UartDriver, UartDriverRef},  // 串口驱动模块
                uart_port::{UartPort, PortRegistration, UartPortOps},  // 串口端口模块，包括串口端口和端口注册
                pl011_config::*,  // PL011配置模块
     },
@@ -77,9 +77,9 @@ const UART_CONFIG_TYPE: i32 = 1 << 0;
 const CONFIG_OF: i32 = 1;
 
 // 设备名称
-const DEV_NAME: &CStr = c_str!("cstery");
+const DEV_NAME: &CStr = c_str!("ttyAMA");
 // 驱动程序名称
-const DRIVER_NAME: &CStr = c_str!("cstery");
+const DRIVER_NAME: &CStr = c_str!("ttyAMA");
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -96,7 +96,7 @@ pub(crate) static mut PORTS: [Option<UartPort>; UART_NR] = [None; UART_NR];
 // AMBA UART控制台的静态结构体
 static AMBA_CONSOLE: Console = {
     let name: [i8; 16usize] = [
-        'c' as _, 's' as _, 't' as _, 'e' as _, 'r' as _, 'y' as _,
+        't' as _, 't' as _, 'y' as _, 'A' as _, 'M' as _, 'A' as _,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     Console::new::<Pl011Console>(name, unsafe { UART_DRIVER.as_ptr() })
@@ -502,6 +502,7 @@ impl AmbaPl011Pops {
         pr_info!("****pl011_read****\n");
         let port_ptr = unsafe { &*port.as_ptr() };
         let addr = port_ptr.membase.wrapping_add(Self::pl011_reg_to_offset(reg));
+
         if u32::from(port_ptr.iotype) == UPIO_MEM32 {
             unsafe { bindings::readl_relaxed(addr as _) }
         } else {
@@ -1675,7 +1676,7 @@ impl UartPortOps for AmbaPl011Pops {
 // PL011注册类型
 type PL011Registrations = PortRegistration<AmbaPl011Pops>;
 // PL011设备数据类型
-type PL011DeviceData = device::Data<PL011Registrations, PL011Resources, PL011Data>;
+type PL011DeviceData = device::Data<Box<PL011Registrations>, PL011Resources, PL011Data>;
 
 struct AmbaDeviceData {
     inner: Pin<UniqueArc<PL011DeviceData>>,
@@ -1776,48 +1777,33 @@ impl amba::Driver for PL011Device {
             parent_irq: irq,
         };
 
-        let mut pl011_registrations: PortRegistration<AmbaPl011Pops> = PortRegistration::new(uap);
+        let mut pl011_registrations = PortRegistration::<AmbaPl011Pops>::new(uap);
 
         /* 确保该 UART 的中断被屏蔽和清除 */
         AmbaPl011Pops::pl011_write(0, &uap, Register::RegImsc as usize); // 屏蔽中断
         AmbaPl011Pops::pl011_write(0xffff, &uap, Register::RegIcr as usize); // 清除中断
 
-        // amba_set_drvdata(dev.clone(), &mut uap);
+        let mut port_registration = Box::try_new(pl011_registrations)?;
 
-        // let pl011_registrations_pin = pin!(PortRegistration::<AmbaPl011Pops>::new(uap));
+        let mut pl011_registrations_pin = unsafe { Pin::new_unchecked(&mut *port_registration) };
 
         unsafe {
             if (*UART_DRIVER.as_ptr()).state.is_null() {
                 &UART_DRIVER.register()?;
-
-                // 注册成功后打印状态信息
-                let state_ptr = (*UART_DRIVER.as_ptr()).state; // 获取状态指针
-                let nr = (*UART_DRIVER.as_ptr()).nr; // 获取状态数量
-
-                pr_info!("UART driver registered successfully. State pointer: {:?}", state_ptr);
-
-                // 打印每个 uart_state 的信息
-                for i in 0..nr {
-                    let uart_state = &*state_ptr.add(i as usize); // 取得 uart_state
-                    pr_info!("UART State{}: port={:p}, ops={:p}, uart_port={:p}\n",
-                            i,
-                            &uart_state.port,
-                            uart_state.port.ops,
-                            uart_state.uart_port,
-                    );
-                }
             }
         }
 
-        &pl011_registrations.register(
+        pl011_registrations_pin.as_mut().register(
             adev,
             unsafe { &UART_DRIVER },
             Box::try_new(pl011_data)?,
         )?;
 
-        unsafe { PORTS[index as usize] = Some(uap) };
+        unsafe {
+            PORTS[index as usize] = Some(port_registration.get_uart_port());
+        }
 
-        let pl011_device_data = new_device_data!(pl011_registrations, pl011_resources, pl011_data, "cstery")?;  // 未知!!!!!  可能有问题
+        let pl011_device_data = new_device_data!(port_registration, pl011_resources, pl011_data, "ttyAMA")?;  // 未知!!!!!  可能有问题
 
         dbg!("********* PL061 GPIO芯片已注册 *********\n");
 
@@ -1827,8 +1813,34 @@ impl amba::Driver for PL011Device {
             })?)
     }
 
-    fn remove(_data: &Self::Data) {
+    fn remove(data: &Self::Data) {
         dbg!("********** PL061 GPIO chip (remove) *********\n");
+
+        let amba_device_data = data.as_ref();
+        let pl011_device_data = &amba_device_data.inner;
+
+        // 释放串口端口资源
+        if let Some(registrations) = pl011_device_data.registrations() {
+            let uart_port = registrations.get_uart_port_ptr();
+
+            unsafe { bindings::uart_remove_one_port(UART_DRIVER.as_ptr(), uart_port) };
+            let mut busy = false;
+            for i in 0..UART_NR {
+                unsafe {
+                    if let Some(uap) = PORTS[i] {
+                        if (*uap.as_ptr()).line == (*uart_port).line{
+                            PORTS[i] = None;
+                        }else {
+                            busy = true;
+                        }
+                    }
+                }
+            }
+            if !busy {
+                unsafe { bindings::uart_unregister_driver(UART_DRIVER.as_ptr()) };
+            }
+        }
+
         pr_info!("移除uart驱动，并释放资源(remove)\n");
     }
 }
@@ -1843,13 +1855,20 @@ module_amba_driver! {
     initcall: "arch",
 }
 
-// module! {
-//     type: Pl011uartMod,
-//     name: "pl011_uart",
-//     author: "Fan",
-//     description: "Rust for linux pl011 uart driver demo",
-//     license: "GPL",
-// }
+fn store_pointer(index: usize, uap: UartPort) {
+    unsafe {
+        // 存储指针
+        PORTS[index] = Some(uap);
+
+        // 打印调试信息
+        pr_info!("uap pointer: {:p}\n", uap.as_ptr());
+        if let Some(ptr) = PORTS[index] {
+            pr_info!("PORTS pointer: {:p}\n", ptr.as_ptr());
+        } else {
+            pr_info!("PORTS pointer is None\n");
+        }
+    }
+}
 
 /// 查找可用的驱动端口。
 fn pl011_find_free_port() -> Result<usize> {
@@ -1899,37 +1918,3 @@ fn pl011_probe_dt_alias(index: i32, dev: device::Device) -> i32 {
 
     ret // 返回索引
 }
-
-// 将私有数据设置到设备结构体中
-fn amba_set_drvdata(dev: device::Device, uap: &mut UartPort) {
-    pr_info!("****amba_set_drvdata****\n");
-    let dev_ptr = dev.raw_device();
-    unsafe { (*dev_ptr).driver_data = uap.as_ptr() as *mut _ };
-}
-
-
-// 定义 Pl011uartMod 结构体，用于内核模块管理
-
-// 下面代码使用module!有用，使用module_amba_driver!无效
-// struct Pl011uartMod {
-//     _dev: Pin<Box<driver::Registration::<amba::Adapter<PL011Device>>>>,
-// }
-
-// 为Pl011uartMod实现内核模块的trait
-// impl kernel::Module for Pl011uartMod {
-//     fn init(module: &'static ThisModule) -> Result<Self> {
-//         pr_info!("Example of Kernel's Pl011uart mechanism (init)\n"); // 模块初始化时打印信息
-//
-//         let d = driver::Registration::<amba::Adapter<PL011Device>>::new_pinned(DRIVER_NAME, module)?;
-//
-//         Ok(Pl011uartMod { _dev: d })
-//     }
-// }
-
-// 实现 Drop 特征以处理模块卸载时的清理操作
-// impl Drop for Pl011uartMod {
-//     // 在模块卸载时打印日志
-//     fn drop(&mut self) {
-//         pr_info!("Rust for linux Pl011uart driver demo (exit)\n");
-//     }
-// }
